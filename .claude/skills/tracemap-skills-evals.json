@@ -1,0 +1,56 @@
+{
+  "skill_set": "tracemap",
+  "note": "Triggering + output-quality eval. Run on claude.ai without subagents: load the skill the description should select, follow it, then grade the output against assertions. Assertions are written so a wrong-skill answer fails them.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "missing-edges-under-load",
+      "prompt": "my dependency map is missing edges under load",
+      "expected_skill": "tracemap-clickhouse-analytics",
+      "distractors": ["tracemap-otel-pipeline", "tracemap-critical-path"],
+      "expected_output": "Diagnose the incremental materialized view self-join as the likely cause, explain the insert-block semantics, prescribe the assembler + refreshable reconciler fix, and give a way to confirm before changing anything.",
+      "assertions": [
+        {"id": "a0", "text": "Names the classic materialized view self-join on spans as the prime suspect"},
+        {"id": "a1", "text": "Explains that an MV SELECT sees only the current insert block, not the table"},
+        {"id": "a2", "text": "Explains WHY parent and child land in different batches (parent finishes after child; collector flushes on size/time)"},
+        {"id": "a3", "text": "Prescribes moving stitching into the stateful assembler and keeping MVs single-table"},
+        {"id": "a4", "text": "Mentions the refreshable MV reconciler and the >2% divergence alert"},
+        {"id": "a5", "text": "Offers a concrete confirmation query or check before changing code"},
+        {"id": "a6", "text": "Does not blame sampling or the collector as the primary cause"}
+      ]
+    },
+    {
+      "id": 1,
+      "name": "detector-alerts-too-much",
+      "prompt": "the detector alerts too much, tune it",
+      "expected_skill": "tracemap-anomaly-eval",
+      "distractors": ["tracemap-deploy-attribution", "tracemap-platform-ops"],
+      "expected_output": "Refuse to tune blind: run the eval set first, read precision and the null-case outcome, then change one knob and re-measure. Name the specific gates and the boiling-frog risk of raising alpha.",
+      "assertions": [
+        {"id": "b0", "text": "Insists on measuring with the eval set before changing thresholds"},
+        {"id": "b1", "text": "Points at the null case as the false-positive measurement"},
+        {"id": "b2", "text": "Names specific knobs: min_requests, sustained_cycles, threshold_ms, alpha"},
+        {"id": "b3", "text": "Warns that raising alpha risks the boiling-frog failure / baseline chasing noise"},
+        {"id": "b4", "text": "Reminds that the baseline must only update on healthy observations"},
+        {"id": "b5", "text": "Changes one variable at a time and re-runs the eval"},
+        {"id": "b6", "text": "Considers that the alerts may be correct (real regression) before assuming the detector is wrong"}
+      ]
+    },
+    {
+      "id": 2,
+      "name": "downsize-to-4gb-vps",
+      "prompt": "I want to move TraceMap to a 4GB VPS to save money, will it fit?",
+      "expected_skill": "tracemap-platform-ops",
+      "distractors": ["tracemap-clickhouse-analytics"],
+      "expected_output": "Say no with the measured component floor table (~7GB), then give real options: Oracle free tier, CX32, or a genuinely trimmed profile with named tradeoffs.",
+      "assertions": [
+        {"id": "c0", "text": "Answers no, it will not fit, without hedging"},
+        {"id": "c1", "text": "Cites the ~7GB measured component floor"},
+        {"id": "c2", "text": "Breaks down RAM by component rather than asserting a single number"},
+        {"id": "c3", "text": "Offers Oracle Always-Free and Hetzner CX32 as the real options"},
+        {"id": "c4", "text": "If a trimmed profile is offered, names what is lost"},
+        {"id": "c5", "text": "Does not silently accept the 4GB premise"}
+      ]
+    }
+  ]
+}
