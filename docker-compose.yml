@@ -1,0 +1,173 @@
+# TraceMap — Phase 1 stack: the traced application, no tracing yet.
+#
+# Profiles let a laptop run a subset:
+#   core   services + datastores          (this phase)
+#   full   + Prometheus, Grafana          (Phase 7; D2 keeps them OUT of core so
+#          the 8 GB CX32 has headroom against the ~7 GB measured floor)
+#   eval   + injectors and the runner     (Phase 7)
+#
+# Phase 2 adds otel-collector and jaeger; Phase 3 adds clickhouse.
+
+name: tracemap
+
+x-fault-env: &fault-env
+  # M23: every fault flag defaults to zero/off and is read per request.
+  TRACEMAP_FAULT_DELAY_MS: ${TRACEMAP_FAULT_DELAY_MS:-0}
+  TRACEMAP_FAULT_ERROR_RATE: ${TRACEMAP_FAULT_ERROR_RATE:-0}
+  TRACEMAP_FAULT_ENDPOINT: ${TRACEMAP_FAULT_ENDPOINT:-}
+  TRACEMAP_FAULT_CPU_BURN_MS: ${TRACEMAP_FAULT_CPU_BURN_MS:-0}
+  TRACEMAP_FAULT_TTL_S: ${TRACEMAP_FAULT_TTL_S:-600}
+
+x-svc-common: &svc-common
+  restart: unless-stopped
+  profiles: [core, full, eval]
+
+services:
+  # ---------------------------------------------------------------- datastores
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./microservices/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tracemap}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    profiles: [core, full, eval]
+
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    profiles: [core, full, eval]
+
+  # ------------------------------------------------------------------ services
+  gateway-svc:
+    <<: *svc-common
+    build: ./microservices/gateway
+    environment:
+      <<: *fault-env
+      SERVICE_NAME: gateway-svc
+      SERVICE_VERSION: ${GIT_SHA:-dev-local}     # M24
+      PORT: 3000
+      ORDER_URL: http://order-svc:3001
+      PRODUCT_URL: http://product-svc:8080
+    ports: ["3000:3000"]
+    depends_on:
+      order-svc: { condition: service_healthy }
+      product-svc: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  order-svc:
+    <<: *svc-common
+    build: ./microservices/order
+    environment:
+      <<: *fault-env
+      SERVICE_NAME: order-svc
+      SERVICE_VERSION: ${GIT_SHA:-dev-local}
+      PORT: 3001
+      USER_URL: http://user-svc:8000
+      PRODUCT_URL: http://product-svc:8080
+      PAYMENT_URL: http://payment-svc:8001
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-tracemap}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      PGDATABASE: ${POSTGRES_DB:-tracemap}
+    depends_on:
+      postgres: { condition: service_healthy }
+      user-svc: { condition: service_healthy }
+      product-svc: { condition: service_healthy }
+      payment-svc: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  user-svc:
+    <<: *svc-common
+    build: ./microservices/user
+    environment:
+      <<: *fault-env
+      SERVICE_NAME: user-svc
+      SERVICE_VERSION: ${GIT_SHA:-dev-local}
+      PORT: 8000
+      SVC_USER_BASE_MS: ${SVC_USER_BASE_MS:-30}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  payment-svc:
+    <<: *svc-common
+    build: ./microservices/payment
+    environment:
+      <<: *fault-env
+      SERVICE_NAME: payment-svc
+      SERVICE_VERSION: ${GIT_SHA:-dev-local}
+      PORT: 8001
+      SVC_PAYMENT_BASE_MS: ${SVC_PAYMENT_BASE_MS:-90}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    ports: ["8001:8001"]        # the eval harness drives /_internal/fault here
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/healthz',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  product-svc:
+    <<: *svc-common
+    build:
+      context: ./microservices/product
+      args:
+        GIT_SHA: ${GIT_SHA:-dev-local}
+    environment:
+      <<: *fault-env
+      SERVICE_NAME: product-svc
+      SERVICE_VERSION: ${GIT_SHA:-dev-local}
+      PORT: 8080
+      SVC_PRODUCT_BASE_MS: ${SVC_PRODUCT_BASE_MS:-45}
+      PRODUCT_N_PLUS_ONE_THRESHOLD: ${PRODUCT_N_PLUS_ONE_THRESHOLD:-3}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/product", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  pgdata:

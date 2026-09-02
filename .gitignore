@@ -1,0 +1,39 @@
+# --- secrets -----------------------------------------------------------------
+# .env.example is committed; .env NEVER is. (Phase 0 trap.)
+.env
+.env.*
+!.env.example
+
+# --- node --------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+.npm/
+coverage/
+
+# --- python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- go ----------------------------------------------------------------------
+microservices/product/product
+microservices/product/product.exe
+
+# --- next.js (Phase 5) -------------------------------------------------------
+.next/
+out/
+dist/
+
+# --- local data & runtime ----------------------------------------------------
+/data/
+*.log
+result.json
+eval-report.md
+
+# --- os ----------------------------------------------------------------------
+.DS_Store
+Thumbs.db
