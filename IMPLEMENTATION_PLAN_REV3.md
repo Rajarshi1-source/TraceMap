@@ -824,8 +824,8 @@ CREATE TABLE tracemap.service_edges_1m
     time_bucket      DateTime,
     source_service   LowCardinality(String),
     target_service   LowCardinality(String),
-    request_count    UInt64,
-    error_count      UInt64,
+    request_count    SimpleAggregateFunction(sum, UInt64),   -- ⚠ CORRECTED
+    error_count      SimpleAggregateFunction(sum, UInt64),   -- ⚠ CORRECTED
     wall_p50_state   AggregateFunction(quantileTDigest(0.50), Float64),
     wall_p95_state   AggregateFunction(quantileTDigest(0.95), Float64),
     wall_p99_state   AggregateFunction(quantileTDigest(0.99), Float64),
@@ -860,6 +860,31 @@ GROUP BY time_bucket, source_service, target_service;
 
 > **Why `AggregatingMergeTree` + an explicit target table, not Rev 2's `SummingMergeTree`?**
 > `SummingMergeTree` only merges numeric columns by summation — it cannot merge TDigest sketches. Rev 2's MV would have kept accumulating unmerged sketch rows, and the "merge percentiles across buckets" trick it advertised wouldn't actually work. `AggregateFunction` columns under `AggregatingMergeTree` are the correct pairing. This is defect #3 in Rev 2, quieter than the join bug but just as real.
+
+> **⚠ CORRECTION (verified 2 Sep 2026) — defect #4, found in Rev 3 itself.**
+> The two counter columns above originally read `request_count UInt64` and
+> `error_count UInt64`. That is wrong for the same reason `SummingMergeTree` is
+> wrong for sketches: `AggregatingMergeTree` merges rows sharing a sorting key
+> but only *combines* `AggregateFunction` and `SimpleAggregateFunction` columns —
+> a plain column keeps one arbitrary value and the rest are discarded. Since the
+> MV fires once per insert block, a single minute receives many rows with the
+> same key, and the counters silently under-count.
+>
+> Measured on ClickHouse 26.3 — three inserts into one minute, one of them an
+> error:
+>
+> | Declaration | request_count | error_count |
+> |---|---|---|
+> | ground truth | 3 | 1 |
+> | `UInt64` (plain, as originally written) | **1** | **0** |
+> | `SimpleAggregateFunction(sum, UInt64)` | 3 | 1 |
+>
+> The error count collapsing to zero is the dangerous half: `error_rate` in Q1 is
+> a ratio of two independently mangled counters, so the red edge colouring would
+> never fire. Note `crit_ms_sum` was already correct in the same statement — the
+> pattern was known and simply not applied to the counters. The reconciler table
+> in §05 keeps a plain `UInt64` legitimately, because it is an ordinary
+> `MergeTree` in `APPEND` mode, not an aggregating one.
 
 ```sql
 -- clickhouse/schema/05_reconciler.sql

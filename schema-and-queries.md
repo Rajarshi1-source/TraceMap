@@ -131,8 +131,8 @@ CREATE TABLE tracemap.service_edges_1m
     time_bucket      DateTime,
     source_service   LowCardinality(String),
     target_service   LowCardinality(String),
-    request_count    UInt64,
-    error_count      UInt64,
+    request_count    SimpleAggregateFunction(sum, UInt64),
+    error_count      SimpleAggregateFunction(sum, UInt64),
     wall_p50_state   AggregateFunction(quantileTDigest(0.50), Float64),
     wall_p95_state   AggregateFunction(quantileTDigest(0.95), Float64),
     wall_p99_state   AggregateFunction(quantileTDigest(0.99), Float64),
@@ -165,6 +165,27 @@ FROM tracemap.trace_edges          -- ONE table. No join. Batch-safe.
 GROUP BY time_bucket, source_service, target_service;
 ```
 
+> **Why the counters are `SimpleAggregateFunction(sum, UInt64)` and not plain
+> `UInt64`.** `AggregatingMergeTree` merges rows sharing a sorting key, but it
+> only *combines* `AggregateFunction` and `SimpleAggregateFunction` columns — a
+> plain column keeps one arbitrary value and the rest are discarded. The MV
+> fires once per insert block, so a single minute receives many rows with the
+> same `(source_service, target_service, time_bucket)` key. Declared plain, the
+> counters silently under-count.
+>
+> Measured on ClickHouse 26.3, three inserts into one minute:
+>
+> | Declaration | request_count | error_count |
+> |---|---|---|
+> | ground truth | 3 | 1 |
+> | `UInt64` (plain) | **1** | **0** |
+> | `SimpleAggregateFunction(sum, UInt64)` | 3 | 1 |
+>
+> Note the second row: the error count collapses to zero, so error-rate edge
+> colouring would never fire. This is the same failure class as the
+> materialized-view self-join — silent, load-dependent under-counting — one
+> layer further down.
+
 Also useful — a service-level RED roll-up, same shape, single table:
 
 ```sql
@@ -172,8 +193,8 @@ CREATE TABLE tracemap.service_red_1m
 (
     time_bucket    DateTime,
     service_name   LowCardinality(String),
-    request_count  UInt64,
-    error_count    UInt64,
+    request_count  SimpleAggregateFunction(sum, UInt64),
+    error_count    SimpleAggregateFunction(sum, UInt64),
     p50_state      AggregateFunction(quantileTDigest(0.50), Float64),
     p95_state      AggregateFunction(quantileTDigest(0.95), Float64),
     p99_state      AggregateFunction(quantileTDigest(0.99), Float64)
