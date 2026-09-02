@@ -17,10 +17,11 @@ help: ## Show this help
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 
-env: ## Write .env from .env.example with the current GIT_SHA
-	@test -f .env && echo "  .env exists - not overwriting" && exit 0 || true
-	@sed 's/^GIT_SHA=.*/GIT_SHA=$(GIT_SHA)/' .env.example > .env
-	@echo "  wrote .env  (GIT_SHA=$(GIT_SHA))"
+env: ## Create .env from .env.example, or refresh GIT_SHA in an existing one
+	@if [ ! -f .env ]; then 	  sed 's/^GIT_SHA=.*/GIT_SHA=$(GIT_SHA)/' .env.example > .env; 	  echo "  wrote .env  (GIT_SHA=$(GIT_SHA))"; 	else 	  sed -i.bak 's/^GIT_SHA=.*/GIT_SHA=$(GIT_SHA)/' .env && rm -f .env.bak; 	  echo "  refreshed .env GIT_SHA=$(GIT_SHA)  (other settings preserved)"; 	fi
+	@# GIT_SHA must track HEAD. It becomes service.version on every span, and a
+	@# stale value makes Phase 6 deploy attribution name the wrong commit --
+	@# which is worse than naming none, because it looks authoritative.
 
 up: env ## Boot the core profile and wait for health
 	$(COMPOSE) --profile core up -d --wait
@@ -55,6 +56,9 @@ fanout-guard: ## M1 - prove the checkout fan-out is concurrent, not sequential
 
 probe-guard: ## M17 - prove /healthz survives a dead database and /readyz does not
 	./scripts/probe-guard.sh
+
+trace-guard: ## Phase 2 - prove one trace spans all five services and the fan-out overlaps
+	@python scripts/trace-guard.py --expect-sha $(GIT_SHA)
 
 skills: ## Rebuild .claude/skills/*.skill from skills/ (D4 - archives are artifacts)
 	@python scripts/build-skills.py

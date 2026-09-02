@@ -1,0 +1,150 @@
+# OTel Collector v0.158.x - GATEWAY TIER.
+#
+# This is the tier that makes the sampling decision and exports. In Kubernetes
+# it runs as a Deployment behind the agent tier's `loadbalancing` exporter
+# (see collector-config.yaml). In docker-compose it is the only collector.
+#
+# M13 - `loadbalancing` is deliberately ABSENT here because compose runs exactly
+# ONE gateway replica. Tail sampling requires every span of a trace to reach the
+# same instance; with two replicas and no trace-ID-aware routing each would see
+# a partial trace and make an arbitrary decision. Running one replica is a
+# decision, not an oversight, so it is written down rather than silently
+# omitted. The Helm chart in Phase 7 runs two replicas and MUST route by traceID.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  # Health and readiness probes fire every few seconds per service. Left in,
+  # they are the highest-volume span in the system and the least useful: nobody
+  # will ever read a /healthz trace, but they would dominate ClickHouse storage
+  # in Phase 3 and skew every RED metric. Dropping them centrally in the
+  # collector applies uniformly across all three languages, rather than needing
+  # per-SDK configuration in each.
+  filter/drop_probes:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["url.path"] == "/healthz"'
+        - 'attributes["url.path"] == "/readyz"'
+        - 'attributes["http.target"] == "/healthz"'
+        - 'attributes["http.target"] == "/readyz"'
+        - 'attributes["http.route"] == "/healthz"'
+        - 'attributes["http.route"] == "/readyz"'
+
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 50000
+    expected_new_traces_per_sec: 200
+    policies:
+      - name: keep-all-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+
+      - name: keep-slow-traces
+        type: latency
+        latency:
+          threshold_ms: 500
+
+      - name: keep-checkout-flow          # the demo path is always sampled
+        type: string_attribute
+        string_attribute:
+          key: http.route
+          values: ["/checkout"]
+
+      # M14 - keep this. Without an unbiased baseline, storage holds only errors
+      # and slow traces, and every percentile or blame share computed downstream
+      # in Phases 3-4 is measured over a biased sample.
+      - name: baseline-probabilistic
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 20
+
+connectors:
+  # M12 - spanmetrics derives RED metrics from the FULL span stream. It is a
+  # connector fed by a pipeline that has NOT been through tail_sampling; if it
+  # sat downstream of the sampler, every rate would be scaled by the sampling
+  # percentage and the dashboards would quietly under-report by 5x.
+  spanmetrics:
+    # Cumulative, explicitly. The Prometheus exporter expects monotonically
+    # increasing counters; with delta temporality every scrape reports only the
+    # change since the last export, so an idle moment reads as 0 and any rate()
+    # over it is wrong.
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+    metrics_flush_interval: 15s
+    histogram:
+      explicit:
+        buckets: [5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s]
+    dimensions:
+      - name: http.route
+      - name: service.version
+    exemplars:
+      enabled: true
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    # M15 - a persistent queue. Without file_storage a collector restart during
+    # a storage blip drops everything in flight, which is exactly when the data
+    # matters most.
+    sending_queue:
+      enabled: true
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 300s
+
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+  debug:
+    verbosity: basic
+
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/queue
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [file_storage, health_check, pprof]
+  pipelines:
+    # Metrics are generated from the UNSAMPLED stream (M12), then the same spans
+    # go through tail sampling for storage.
+    traces/metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/drop_probes]
+      exporters: [spanmetrics]
+
+    traces/storage:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/drop_probes, tail_sampling, batch]
+      exporters: [otlp/jaeger]
+
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      exporters: [prometheus]
+
+  telemetry:
+    metrics:
+      level: detailed          # the collector traces and measures itself

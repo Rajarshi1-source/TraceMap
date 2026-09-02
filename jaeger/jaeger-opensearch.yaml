@@ -1,0 +1,72 @@
+# Jaeger v2.20 - STORAGE_PROFILE=opensearch
+#
+# The fallback that makes depending on an alpha backend defensible. If the
+# ClickHouse feature gate breaks on an upgrade, this is one env var away and the
+# analytics tier is unaffected, because TraceMap never reads Jaeger's tables.
+#
+# Jaeger recommends OpenSearch over Cassandra for large-scale production, and
+# Elasticsearch 6 support was REMOVED in v2.20 - for anyone on ES 6 that is a
+# migration, not a config change.
+
+service:
+  extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      service.name: jaeger
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: 0.0.0.0:13133
+
+  jaeger_query:
+    storage:
+      traces: main_store
+    http:
+      endpoint: 0.0.0.0:16686
+    grpc:
+      endpoint: 0.0.0.0:16685
+
+  jaeger_storage:
+    backends:
+      main_store:
+        opensearch:
+          servers: [http://opensearch:9200]
+          indices:
+            index_prefix: jaeger-main
+            spans:
+              date_layout: "2006-01-02"
+              rollover_frequency: day
+              shards: 1
+              replicas: 0
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: main_store

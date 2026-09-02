@@ -22,8 +22,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 )
 
 // gitSHA is injected at build time via -ldflags.
@@ -58,7 +60,24 @@ func main() {
 	}
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn())
+
+	service := envStr("SERVICE_NAME", "product-svc")
+	version := envStr("SERVICE_VERSION", gitSHA)
+	shutdownTracing := initTracing(ctx, service, version)
+	defer func() { _ = shutdownTracing(context.Background()) }()
+
+	cfg, err := pgxpool.ParseConfig(dsn())
+	if err != nil {
+		log.Fatalf("pgxpool config: %v", err)
+	}
+	// Explicit again: pgx has no runtime hook either, so the tracer is attached
+	// to the pool. This is what turns the deliberate N+1 into a visible row of
+	// sibling DB spans in the waterfall.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer(
+		otelpgx.WithTrimSQLInSpanName(),
+		otelpgx.WithDisableQuerySpanNamePrefix(),
+	)
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		log.Fatalf("pgxpool: %v", err)
 	}
@@ -69,15 +88,19 @@ func main() {
 		baseMS:   envInt("SVC_PRODUCT_BASE_MS", 45),
 		nPlusOne: envInt("PRODUCT_N_PLUS_ONE_THRESHOLD", 3),
 		faults:   NewFaultConfig(),
-		service:  envStr("SERVICE_NAME", "product-svc"),
-		version:  envStr("SERVICE_VERSION", gitSHA),
+		service:  service,
+		version:  version,
 	}
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	// Phase 2: r.Use(otelgin.Middleware("product-svc")) - explicit, because no
-	// runtime agent exists for Go.
+	// M11 - explicit middleware, because no runtime agent exists for Go.
+	// Health and readiness probes are excluded: they fire every few seconds and
+	// would swamp the trace store with spans nobody will ever read.
+	r.Use(otelgin.Middleware(service, otelgin.WithFilter(func(req *http.Request) bool {
+		return req.URL.Path != "/healthz" && req.URL.Path != "/readyz"
+	})))
 
 	r.POST("/stock/check", s.checkStock)
 	r.GET("/products", s.listProducts)

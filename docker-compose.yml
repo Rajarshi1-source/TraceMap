@@ -18,6 +18,19 @@ x-fault-env: &fault-env
   TRACEMAP_FAULT_CPU_BURN_MS: ${TRACEMAP_FAULT_CPU_BURN_MS:-0}
   TRACEMAP_FAULT_TTL_S: ${TRACEMAP_FAULT_TTL_S:-600}
 
+x-otel-env: &otel-env
+  # M24 - service.version rides on every span as a resource attribute. Deploy
+  # attribution (Phase 6) and trace-to-code both key off this one line.
+  OTEL_RESOURCE_ATTRIBUTES: "service.version=${GIT_SHA:-dev-local},deployment.environment=local"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  # Head sampling OFF: the collector's tail sampler decides, once it can see the
+  # whole trace. Enabling both without meaning to is a classic way to silently
+  # sample twice.
+  OTEL_TRACES_SAMPLER: parentbased_always_on
+  OTEL_METRICS_EXPORTER: none
+  OTEL_LOGS_EXPORTER: none
+
 x-svc-common: &svc-common
   restart: unless-stopped
   profiles: [core, full, eval]
@@ -54,12 +67,70 @@ services:
       retries: 10
     profiles: [core, full, eval]
 
+  # ------------------------------------------------------------------ tracing
+  # Both jaeger and the collector run as uid 10001, but a fresh named volume is
+  # created root-owned because its mount path does not exist in either image.
+  # This one-shot init fixes ownership before they start. It is the compose
+  # equivalent of the initContainer the Helm chart needs in Phase 7 - keeping
+  # both containers non-root is worth one extra service.
+  volume-init:
+    image: alpine:3.22
+    command: ["sh", "-c", "mkdir -p /jaeger /queue && chown -R 10001:10001 /jaeger /queue"]
+    volumes:
+      - jaegerdata:/jaeger
+      - otelqueue:/queue
+    profiles: [core, full, eval]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.20.0
+    command: ["--config", "/jaeger/config.yaml"]
+    volumes:
+      # One env var swaps the storage backend. Depending on an alpha feature
+      # (native ClickHouse) is acceptable; depending on it with no tested
+      # fallback is not.
+      - ./jaeger/jaeger-${STORAGE_PROFILE:-badger}.yaml:/jaeger/config.yaml:ro
+      - jaegerdata:/var/lib/jaeger
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+    ports:
+      - "16686:16686"     # UI
+    healthcheck:
+      # The image is distroless (no shell, no curl), so the binary probes
+      # itself. `version` exits 0 only once the process is up.
+      test: ["CMD", "/cmd/jaeger/jaeger-linux", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    profiles: [core, full, eval]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.158.0
+    command: ["--config", "/etc/otel/collector-gateway-config.yaml"]
+    volumes:
+      - ./otel:/etc/otel:ro
+      - otelqueue:/var/lib/otelcol/queue    # M15 - persistent sending queue
+    ports:
+      - "8889:8889"       # spanmetrics -> Prometheus scrape
+      - "13133:13133"     # health_check
+    depends_on:
+      volume-init: { condition: service_completed_successfully }
+      jaeger: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    profiles: [core, full, eval]
+
   # ------------------------------------------------------------------ services
   gateway-svc:
     <<: *svc-common
     build: ./microservices/gateway
     environment:
-      <<: *fault-env
+      <<: [*fault-env, *otel-env]
+      OTEL_SERVICE_NAME: gateway-svc
       SERVICE_NAME: gateway-svc
       SERVICE_VERSION: ${GIT_SHA:-dev-local}     # M24
       PORT: 3000
@@ -67,6 +138,7 @@ services:
       PRODUCT_URL: http://product-svc:8080
     ports: ["3000:3000"]
     depends_on:
+      otel-collector: { condition: service_started }
       order-svc: { condition: service_healthy }
       product-svc: { condition: service_healthy }
     healthcheck:
@@ -79,7 +151,8 @@ services:
     <<: *svc-common
     build: ./microservices/order
     environment:
-      <<: *fault-env
+      <<: [*fault-env, *otel-env]
+      OTEL_SERVICE_NAME: order-svc
       SERVICE_NAME: order-svc
       SERVICE_VERSION: ${GIT_SHA:-dev-local}
       PORT: 3001
@@ -97,6 +170,7 @@ services:
     # public ingress.
     ports: ["3001:3001"]
     depends_on:
+      otel-collector: { condition: service_started }
       postgres: { condition: service_healthy }
       user-svc: { condition: service_healthy }
       product-svc: { condition: service_healthy }
@@ -111,7 +185,8 @@ services:
     <<: *svc-common
     build: ./microservices/user
     environment:
-      <<: *fault-env
+      <<: [*fault-env, *otel-env]
+      OTEL_SERVICE_NAME: user-svc
       SERVICE_NAME: user-svc
       SERVICE_VERSION: ${GIT_SHA:-dev-local}
       PORT: 8000
@@ -123,6 +198,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
     ports: ["8000:8000"]
     depends_on:
+      otel-collector: { condition: service_started }
       postgres: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=2).status==200 else 1)"]
@@ -134,7 +210,8 @@ services:
     <<: *svc-common
     build: ./microservices/payment
     environment:
-      <<: *fault-env
+      <<: [*fault-env, *otel-env]
+      OTEL_SERVICE_NAME: payment-svc
       SERVICE_NAME: payment-svc
       SERVICE_VERSION: ${GIT_SHA:-dev-local}
       PORT: 8001
@@ -146,6 +223,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
     ports: ["8001:8001"]        # the eval harness drives /_internal/fault here
     depends_on:
+      otel-collector: { condition: service_started }
       postgres: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/healthz',timeout=2).status==200 else 1)"]
@@ -160,7 +238,8 @@ services:
       args:
         GIT_SHA: ${GIT_SHA:-dev-local}
     environment:
-      <<: *fault-env
+      <<: [*fault-env, *otel-env]
+      OTEL_SERVICE_NAME: product-svc
       SERVICE_NAME: product-svc
       SERVICE_VERSION: ${GIT_SHA:-dev-local}
       PORT: 8080
@@ -173,6 +252,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
     ports: ["8080:8080"]
     depends_on:
+      otel-collector: { condition: service_started }
       postgres: { condition: service_healthy }
     healthcheck:
       test: ["CMD", "/product", "-healthcheck"]
@@ -182,3 +262,5 @@ services:
 
 volumes:
   pgdata:
+  jaegerdata:
+  otelqueue:

@@ -1,0 +1,73 @@
+# Jaeger v2.20 - STORAGE_PROFILE=clickhouse
+#
+# Native ClickHouse storage landed in Jaeger v2.18 and is ALPHA, behind a
+# feature gate. Depending on an alpha feature is acceptable; depending on it
+# with no fallback is not - hence three profiles and one env var.
+#
+# Jaeger owns the `jaeger` database. TraceMap's own analytics live in a separate
+# `tracemap` database on the same server. M16 - never write to Jaeger's tables
+# and never build materialized views on them: the alpha schema is free to change
+# underneath us.
+#
+# Wired in Phase 3, when ClickHouse exists. Phase 2 verifies badger only.
+
+service:
+  extensions: [jaeger_storage, jaeger_query, healthcheckv2]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+  telemetry:
+    resource:
+      service.name: jaeger
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+
+extensions:
+  healthcheckv2:
+    use_v2: true
+    http:
+      endpoint: 0.0.0.0:13133
+
+  jaeger_query:
+    storage:
+      traces: main_store
+    http:
+      endpoint: 0.0.0.0:16686
+    grpc:
+      endpoint: 0.0.0.0:16685
+
+  jaeger_storage:
+    backends:
+      main_store:
+        clickhouse:
+          connection:
+            endpoint: tcp://clickhouse:9000
+            database: jaeger
+            username: ${env:CLICKHOUSE_USER:-default}
+            password: ${env:CLICKHOUSE_PASSWORD:-}
+          create_schema: true
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: main_store

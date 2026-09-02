@@ -375,9 +375,9 @@ footer{
   <dl class="metastrip">
     <div><dt>Implementation code found</dt><dd>0 <small>lines</small></dd></div>
     <div><dt>Algorithm tests run</dt><dd>6 / 6 <small>pass</small></dd></div>
-    <div><dt>Defects found</dt><dd>7 <small>all verified &amp; fixed</small></dd></div>
+    <div><dt>Defects found</dt><dd>9 <small>all verified &amp; fixed</small></dd></div>
     <div><dt>Binding mandates</dt><dd>30</dd></div>
-    <div><dt>Phases shipped</dt><dd>2 / 9 <small>0 and 1 verified</small></dd></div>
+    <div><dt>Phases shipped</dt><dd>3 / 9 <small>0, 1 and 2 verified</small></dd></div>
   </dl>
 
   <div class="tw" style="margin-top:26px">
@@ -386,8 +386,8 @@ footer{
       <tbody>
         <tr><td><strong>0 — Repo bootstrap</strong></td><td><span class="pill ok">Done</span> <code>5e22e2a</code></td><td>3 / 3 exit criteria verified</td></tr>
         <tr><td><strong>1 — Traced application</strong></td><td><span class="pill ok">Done</span> <code>c4653ee</code></td><td>5 / 5 verified against the running stack</td></tr>
-        <tr><td>2 — Instrumentation + Jaeger</td><td><span class="pill acc">In progress</span></td><td></td></tr>
-        <tr><td>3 — ClickHouse tier</td><td>Not started</td><td></td></tr>
+        <tr><td><strong>2 — Instrumentation + Jaeger</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; one 28-span trace across all five services</td></tr>
+        <tr><td>3 — ClickHouse tier</td><td><span class="pill acc">Next</span></td><td></td></tr>
         <tr><td>4 — Critical path ⭐</td><td>Not started</td><td></td></tr>
         <tr><td>5 — API + dashboard</td><td>Not started</td><td></td></tr>
         <tr><td>6 — Detector + deploy attribution</td><td>Not started</td><td></td></tr>
@@ -602,6 +602,24 @@ error_count      SimpleAggregateFunction(sum, UInt64),</code></pre>
   <div class="callout">
     <span class="tag">Not a defect, but worth writing down</span>
     <p><strong>GNU make is not bundled with Git for Windows</strong>, and the Makefile is the interface every phase's exit criteria are expressed in. <code>winget install ezwinports.make</code> provides it.</p>
+  </div>
+
+  <h3 style="margin-top:38px">Found while building — Phase 2</h3>
+
+  <h3><span class="pill crit">F8</span> &nbsp;spanmetrics read zero on every counter</h3>
+  <p>The <code>spanmetrics</code> connector feeds the <code>prometheus</code> exporter. With its default aggregation temporality each export carried only the change since the last, while Prometheus expects monotonically increasing counters. The symptom was series that <strong>existed with correct labels and a value of <code>0</code></strong>:</p>
+  <pre><code>gateway-svc | SPAN_KIND_SERVER | GET            = <span class="bad">0</span>
+product-svc | SPAN_KIND_SERVER | GET /products  = <span class="bad">0</span></code></pre>
+  <p>A bad failure mode, because it <em>looks</em> configured — nothing errors, the series are present, and a dashboard renders a flat zero that reads as "no traffic" rather than "broken pipeline". Every RED metric, the SLOs, and the Phase 7 k6 gate would have been built on it. Fixed by pinning <code>aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE</code>; 100 requests then produced exactly <code>GET = 100</code>.</p>
+
+  <h3><span class="pill warn">F9</span> &nbsp;.env pinned a stale GIT_SHA</h3>
+  <p><code>make env</code> refused to touch an existing <code>.env</code>, so <code>GIT_SHA</code> stayed at whatever HEAD was when the file was created — two commits later every span still carried the old SHA. Caught only because the trace guard compares <code>service.version</code> against <code>git rev-parse</code>.</p>
+  <p><strong>A stale <code>service.version</code> is worse than a missing one:</strong> Phase 6 deploy attribution would confidently name the wrong commit, and the alert would look authoritative while pointing at an innocent change.</p>
+
+  <div class="callout">
+    <span class="tag">Two improvements the phase forced</span>
+    <p><strong>Health probes are dropped at the collector.</strong> <code>/healthz</code> and <code>/readyz</code> fire every few seconds per service and were the highest-volume span in the system, and the least useful. One <code>filter/drop_probes</code> processor covers all three languages and materially cuts what Phase 3 must store.</p>
+    <p><strong>Non-root containers against root-owned volumes.</strong> Jaeger and the collector both run as uid 10001, but a fresh named volume is root-owned because its mount path does not exist in either image. A one-shot <code>volume-init</code> fixes ownership first — the compose equivalent of the initContainer Phase 7 needs. Running them as root would have been one line shorter and wrong.</p>
   </div>
 </section>
 

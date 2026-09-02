@@ -12,8 +12,10 @@ COPY --chown=app:app package.json ./
 COPY --chown=app:app src ./src
 USER app
 
-# Phase 2 adds:
-#   ENV NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"
+# Zero-code instrumentation. Node and Python get this genuinely, via a runtime
+# agent; Go does NOT (M11) - see microservices/product, which wraps handlers
+# explicitly because a compiled binary has no runtime hook to attach to.
+ENV NODE_OPTIONS="--require @opentelemetry/auto-instrumentations-node/register"
 
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

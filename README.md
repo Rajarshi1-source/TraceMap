@@ -19,9 +19,11 @@ order-svc            |------------------------------------- 730ms --|
 
 Making `product-svc` infinitely fast would save the user nothing.
 
-> **Status: Phase 1 of 8.** The traced application runs; tracing lands in
-> Phase 2. See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the build
-> order, exit criteria and the four defects found during the design audit.
+> **Status: Phase 2 of 8 complete.** Five services are traced end to end through
+> an OpenTelemetry collector into Jaeger v2.20. The analytics tier and the
+> critical-path engine land in Phases 3 and 4. See
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the build order, exit
+> criteria and the defects found along the way.
 
 ---
 
@@ -32,6 +34,10 @@ make env      # write .env from .env.example, with GIT_SHA filled in
 make up       # boot the core profile
 make smoke    # end-to-end check through all five services
 ```
+
+Then open **http://localhost:16686** for the Jaeger UI. `make demo` seeds 60s of
+traffic first, because a demo that opens on an empty graph is a demo you have
+already lost.
 
 `make` on its own lists every target.
 
@@ -68,7 +74,8 @@ has nothing to demonstrate. It is one careless refactor away, so it is asserted
 by a test:
 
 ```bash
-make fanout-guard
+make fanout-guard   # unit level: the orchestration is concurrent
+make trace-guard    # system level: it survived the network and the collector
 ```
 
 ## Architecture (target)

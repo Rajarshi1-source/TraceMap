@@ -22,7 +22,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 |---|---|---|
 | **0 — Repo bootstrap** | ✅ **Done** (`5e22e2a`) | 3/3 exit criteria verified |
 | **1 — Traced application** | ✅ **Done** (`c4653ee`) | 5/5 exit criteria verified against the running stack |
-| 2 — Instrumentation + Jaeger | In progress | |
+| **2 — Instrumentation + Jaeger** | ✅ **Done** | 6/6 verified; one 28-span trace across all five services |
 | 3 — ClickHouse tier | Not started | |
 | 4 — Critical path ⭐ | Not started | |
 | 5 — API + dashboard | Not started | |
@@ -352,6 +352,68 @@ against recorded checksums.
 **GNU make is not bundled with Git for Windows.** The Makefile is the interface
 every phase's exit criteria are expressed in. `winget install ezwinports.make`
 provides it; the README says so.
+
+
+---
+
+## 2c. Found while building (Phase 2)
+
+### F8 — 🔴 spanmetrics defaulted to delta temporality, so every counter read zero
+
+The `spanmetrics` connector feeds the `prometheus` exporter. With the connector's
+default aggregation temporality, each export carried only the change since the
+last one, while the Prometheus exporter expects monotonically increasing
+counters. The visible symptom was that every series **existed with the correct
+labels and a value of `0`**:
+
+```
+gateway-svc | SPAN_KIND_SERVER | GET = 0
+product-svc | SPAN_KIND_SERVER | GET /products = 0
+```
+
+That is a bad failure mode, because the metric looks configured. Nothing errors,
+the series are present, and a dashboard renders a flat line at zero that reads as
+"no traffic" rather than "broken pipeline". Every RED metric, every SLO in §24
+and the whole k6 SLO gate in Phase 7 would have been built on it.
+
+Fixed by pinning it explicitly:
+
+```yaml
+connectors:
+  spanmetrics:
+    aggregation_temporality: AGGREGATION_TEMPORALITY_CUMULATIVE
+    metrics_flush_interval: 15s
+```
+
+After the fix, 100 requests produced exactly `GET = 100`.
+
+### F9 — 🟡 `.env` pinned a stale `GIT_SHA`, silently mis-versioning every span
+
+`make env` originally refused to touch an existing `.env`, so `GIT_SHA` stayed at
+whatever HEAD was when the file was first created. Two commits later every span
+still carried the old SHA — caught only because `trace-guard.py` compares
+`service.version` against `git rev-parse`.
+
+This matters more than it looks. **A stale `service.version` is worse than a
+missing one**: Phase 6 deploy attribution would confidently name the wrong
+commit, and the alert would look authoritative while pointing at an innocent
+change. `make env` now refreshes the `GIT_SHA` line while preserving every other
+setting.
+
+### Two improvements the phase forced, worth keeping
+
+**Health probes are dropped at the collector.** `/healthz` and `/readyz` fire
+every few seconds per service and were the single highest-volume span in the
+system — and the least useful. A `filter/drop_probes` processor removes them in
+both pipelines. Doing it centrally rather than per-SDK keeps one rule across
+three languages, and it materially reduces what Phase 3 has to store.
+
+**Both containers run non-root against root-owned volumes.** Jaeger and the
+collector both run as uid 10001, but a fresh named volume is created root-owned
+because its mount path does not exist in either image. A one-shot `volume-init`
+service fixes ownership before they start — the compose equivalent of the
+initContainer the Helm chart will need in Phase 7. Running them as root would
+have been one line shorter and wrong.
 
 ---
 
