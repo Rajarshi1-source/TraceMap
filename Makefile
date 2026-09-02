@@ -60,6 +60,14 @@ probe-guard: ## M17 - prove /healthz survives a dead database and /readyz does n
 trace-guard: ## Phase 2 - prove one trace spans all five services and the fan-out overlaps
 	@python scripts/trace-guard.py --expect-sha $(GIT_SHA)
 
+schema-guard: ## Phase 3 - assert the ClickHouse DDL invariants (M2/M3, F1, M4, M16)
+	@python scripts/schema-guard.py
+
+profile-matrix: ## Phase 3 - boot every Jaeger storage profile and prove traces land
+	./scripts/profile-matrix.sh
+
+guards: fanout-guard probe-guard trace-guard schema-guard ## Run every invariant guard
+
 skills: ## Rebuild .claude/skills/*.skill from skills/ (D4 - archives are artifacts)
 	@python scripts/build-skills.py
 

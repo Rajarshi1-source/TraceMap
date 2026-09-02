@@ -161,6 +161,30 @@ def main() -> int:
         wrong = {k: v for k, v in versions.items() if v != args.expect_sha}
         check(f"service.version == {args.expect_sha}", not wrong, str(wrong) if wrong else "")
 
+    # ---- 4: M28 ----------------------------------------------------------
+    # Spans are retained for days and readable by anyone with dashboard access,
+    # so a literal amount or user handle in db.statement is a data leak with a
+    # long tail. The parameterised text is kept - it is what makes the N+1
+    # diagnosable - but the values must never ride along. This regresses
+    # silently the first time someone builds a query by string concatenation.
+    statements = [
+        str(tag["value"])
+        for s in trace["spans"]
+        for tag in s.get("tags", [])
+        if tag["key"] in ("db.statement", "db.query.text")
+    ]
+    leaked = [
+        (needle, st)
+        for st in statements
+        for needle in ("user-1", "SKU-1", "1999")
+        if needle in st
+    ]
+    check(
+        f"no literal parameter values in db.statement ({len(statements)} captured, M28)",
+        not leaked,
+        f"LEAKED {leaked[0][0]!r} in: {leaked[0][1][:120]}" if leaked else "",
+    )
+
     print("\n  TRACE GUARD " + ("PASS" if not fail else "FAIL") + "\n")
     return fail
 

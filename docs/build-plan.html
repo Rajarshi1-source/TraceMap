@@ -375,9 +375,9 @@ footer{
   <dl class="metastrip">
     <div><dt>Implementation code found</dt><dd>0 <small>lines</small></dd></div>
     <div><dt>Algorithm tests run</dt><dd>6 / 6 <small>pass</small></dd></div>
-    <div><dt>Defects found</dt><dd>9 <small>all verified &amp; fixed</small></dd></div>
+    <div><dt>Defects found</dt><dd>11 <small>all verified &amp; fixed</small></dd></div>
     <div><dt>Binding mandates</dt><dd>30</dd></div>
-    <div><dt>Phases shipped</dt><dd>3 / 9 <small>0, 1 and 2 verified</small></dd></div>
+    <div><dt>Phases shipped</dt><dd>4 / 9 <small>0-3 verified</small></dd></div>
   </dl>
 
   <div class="tw" style="margin-top:26px">
@@ -387,8 +387,8 @@ footer{
         <tr><td><strong>0 — Repo bootstrap</strong></td><td><span class="pill ok">Done</span> <code>5e22e2a</code></td><td>3 / 3 exit criteria verified</td></tr>
         <tr><td><strong>1 — Traced application</strong></td><td><span class="pill ok">Done</span> <code>c4653ee</code></td><td>5 / 5 verified against the running stack</td></tr>
         <tr><td><strong>2 — Instrumentation + Jaeger</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; one 28-span trace across all five services</td></tr>
-        <tr><td>3 — ClickHouse tier</td><td><span class="pill acc">Next</span></td><td></td></tr>
-        <tr><td>4 — Critical path ⭐</td><td>Not started</td><td></td></tr>
+        <tr><td><strong>3 — ClickHouse tier</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; 14 objects from an empty server, both storage profiles boot</td></tr>
+        <tr><td>4 — Critical path ⭐</td><td><span class="pill acc">Next</span></td><td></td></tr>
         <tr><td>5 — API + dashboard</td><td>Not started</td><td></td></tr>
         <tr><td>6 — Detector + deploy attribution</td><td>Not started</td><td></td></tr>
         <tr><td>7 — Eval harness + CI ⭐</td><td>Not started</td><td></td></tr>
@@ -616,8 +616,25 @@ product-svc | SPAN_KIND_SERVER | GET /products  = <span class="bad">0</span></co
   <p><code>make env</code> refused to touch an existing <code>.env</code>, so <code>GIT_SHA</code> stayed at whatever HEAD was when the file was created — two commits later every span still carried the old SHA. Caught only because the trace guard compares <code>service.version</code> against <code>git rev-parse</code>.</p>
   <p><strong>A stale <code>service.version</code> is worse than a missing one:</strong> Phase 6 deploy attribution would confidently name the wrong commit, and the alert would look authoritative while pointing at an innocent change.</p>
 
+  <h3 style="margin-top:38px">Found while building — Phase 3</h3>
+
+  <h3><span class="pill crit">F10</span> &nbsp;The exporter owns its schema, and its sorting key is wrong for us</h3>
+  <p>The plan assumed <code>tracemap.spans</code> would be written directly by the collector with our column names. It cannot be. The exporter owns its wire schema — PascalCase columns, nanosecond <code>Duration</code> — and, more importantly:</p>
+  <pre><code><span class="k">ORDER BY</span> (ServiceName, SpanName, toDateTime(Timestamp))</code></pre>
+  <p>That suits "show me this service's spans". It is wrong for the dominant read here — the assembler asking <em>"give me every span in THIS trace"</em>, thousands of times a minute. In ClickHouse the sorting key <strong>is</strong> the primary index, so it must match the dominant access pattern.</p>
+  <p>Resolved by owning both: <code>otel_spans</code> is a thin landing table matching the exporter exactly, and <code>tracemap.spans</code> is ours with <code>ORDER BY (trace_id, start_time_unix_ns)</code>, filled by a <strong>single-table</strong> projection view — a rename, not a stitch, so it cannot suffer the batch-boundary bug. The exporter now runs <code>create_schema: false</code>, which is what makes "all seven files apply to an empty ClickHouse" actually true. Cost: 24h retention on the landing table against 7 days for spans, so ~14% overhead rather than 100%.</p>
+
+  <h3><span class="pill warn">F11</span> &nbsp;The criterion-6 grep fires on its own documentation</h3>
+  <p>The plan phrases the M2/M3 gate as <code>! grep -riE "JOIN" 04_materialized_views.sql</code>. That fails the moment the file <em>documents</em> why a join must not be there — which is the first thing anyone should write in it. Documenting a trap should not fail the check for the trap. <code>schema-guard.py</code> strips comments, then asserts four invariants on the DDL.</p>
+
   <div class="callout">
-    <span class="tag">Two improvements the phase forced</span>
+    <span class="tag">The alpha backend behaved exactly as ADR 0002 predicted</span>
+    <p><code>STORAGE_PROFILE=clickhouse</code> needed three things the documents never named: a config schema of <code>addresses</code> / <code>database</code> / <code>auth.basic</code> (found by probing the binary — an alpha config surface is not something to guess), the <code>jaeger</code> database provisioned first, and <code>--feature-gates=storage.clickhouse</code>, without which Jaeger refuses to start and says why: <em>"ClickHouse storage is experimental and must be explicitly enabled. The schema is subject to breaking changes."</em></p>
+    <p>That message is the justification for the entire profile mechanism. <code>profile-matrix.sh</code> now boots each profile and asserts traces land, so the fallback is tested rather than claimed.</p>
+  </div>
+
+  <div class="callout">
+    <span class="tag">Two improvements Phase 2 forced</span>
     <p><strong>Health probes are dropped at the collector.</strong> <code>/healthz</code> and <code>/readyz</code> fire every few seconds per service and were the highest-volume span in the system, and the least useful. One <code>filter/drop_probes</code> processor covers all three languages and materially cuts what Phase 3 must store.</p>
     <p><strong>Non-root containers against root-owned volumes.</strong> Jaeger and the collector both run as uid 10001, but a fresh named volume is root-owned because its mount path does not exist in either image. A one-shot <code>volume-init</code> fixes ownership first — the compose equivalent of the initContainer Phase 7 needs. Running them as root would have been one line shorter and wrong.</p>
   </div>

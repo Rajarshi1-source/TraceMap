@@ -23,7 +23,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **0 — Repo bootstrap** | ✅ **Done** (`5e22e2a`) | 3/3 exit criteria verified |
 | **1 — Traced application** | ✅ **Done** (`c4653ee`) | 5/5 exit criteria verified against the running stack |
 | **2 — Instrumentation + Jaeger** | ✅ **Done** | 6/6 verified; one 28-span trace across all five services |
-| 3 — ClickHouse tier | Not started | |
+| **3 — ClickHouse tier** | ✅ **Done** | 6/6 verified; 14 objects from an empty server, both storage profiles boot |
 | 4 — Critical path ⭐ | Not started | |
 | 5 — API + dashboard | Not started | |
 | 6 — Detector + deploy attribution | Not started | |
@@ -414,6 +414,73 @@ because its mount path does not exist in either image. A one-shot `volume-init`
 service fixes ownership before they start — the compose equivalent of the
 initContainer the Helm chart will need in Phase 7. Running them as root would
 have been one line shorter and wrong.
+
+
+---
+
+## 2d. Found while building (Phase 3)
+
+### F10 — 🔴 The exporter owns its schema, and its sorting key is wrong for us
+
+The plan assumed `tracemap.spans` would be written directly by the collector
+with our column names. It cannot be. The ClickHouse exporter owns its wire
+schema — PascalCase columns, `Duration` in nanoseconds — and, more importantly:
+
+```sql
+ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
+```
+
+That suits "show me this service's spans". It is wrong for the dominant read in
+this project, which is the assembler asking *"give me every span in THIS
+trace"*, thousands of times a minute. In ClickHouse the sorting key **is** the
+primary index, so it has to match the dominant access pattern — the very point
+§12b defends in the interview answer about sorting keys.
+
+Resolved by owning both: `otel_spans` is a thin landing table matching the
+exporter exactly, and `tracemap.spans` is ours with `ORDER BY (trace_id,
+start_time_unix_ns)`, filled by a **single-table** projection view. That view is
+a rename, not a stitch, so it cannot suffer the batch-boundary bug (M2/M3).
+
+The exporter now runs `create_schema: false`, which is what makes exit criterion
+1 — *all seven files apply cleanly to an empty ClickHouse* — actually true
+rather than "true once the exporter has written something first".
+
+Cost: spans land twice. `07_retention.sql` keeps the landing table for 24h
+against 7 days for `spans`, so steady-state overhead is roughly 14%, not 100%.
+
+### F11 — 🟡 The plan's criterion-6 grep fires on its own documentation
+
+The plan phrases the M2/M3 gate as:
+
+```bash
+! grep -riE "JOIN" clickhouse/schema/04_materialized_views.sql
+```
+
+That fails the moment the file *documents* why a join must not be there — which
+is the first thing anyone should write in it. Documenting a trap should not
+fail the check for the trap.
+
+`scripts/schema-guard.py` strips SQL comments first, then asserts on the DDL,
+and checks four invariants rather than one: no join in a **classic** MV (the
+reconciler's `REFRESH EVERY` self-join is correctly exempt), F1 counter types,
+no `SummingMergeTree`, and nothing building on `jaeger.*`.
+
+### The alpha backend behaved exactly as ADR 0002 predicted
+
+`STORAGE_PROFILE=clickhouse` needed three things the documents did not name: a
+config schema of `addresses` / `database` / `auth.basic` / `dial_timeout` /
+`create_schema` (determined by probing the binary — an alpha config surface is
+not something to guess), the `jaeger` database provisioned in advance, and
+
+```
+--feature-gates=storage.clickhouse
+```
+
+without which Jaeger refuses to start and says why: *"ClickHouse storage is
+experimental and must be explicitly enabled. The schema is subject to breaking
+changes."* That message is the justification for the whole profile mechanism.
+`scripts/profile-matrix.sh` now boots each profile and asserts traces land, so
+the fallback is tested rather than merely claimed.
 
 ---
 

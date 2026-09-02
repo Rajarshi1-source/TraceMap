@@ -67,6 +67,34 @@ services:
       retries: 10
     profiles: [core, full, eval]
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3-alpine
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-tracemap}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-tracemap}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me-locally}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - chdata:/var/lib/clickhouse
+      # 0*.sql run once, in order, on an empty data directory.
+      - ./clickhouse/schema:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "8123:8123"     # HTTP
+      - "9000:9000"     # native
+    healthcheck:
+      # 127.0.0.1, NOT localhost. Inside the container `localhost` resolves to
+      # ::1 first, and the image binds ::1 only when IPv6 is available on the
+      # network - which it is not here, so the probe gets connection refused
+      # while the server is perfectly healthy on IPv4.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    profiles: [core, full, eval]
+
   # ------------------------------------------------------------------ tracing
   # Both jaeger and the collector run as uid 10001, but a fresh named volume is
   # created root-owned because its mount path does not exist in either image.
@@ -83,7 +111,15 @@ services:
 
   jaeger:
     image: jaegertracing/jaeger:2.20.0
-    command: ["--config", "/jaeger/config.yaml"]
+    # The feature gate is required by STORAGE_PROFILE=clickhouse and is inert
+    # for badger and opensearch. Jaeger refuses to start the ClickHouse backend
+    # without it, and says why: the storage is experimental and its schema is
+    # subject to breaking changes. That warning is the reason profiles exist.
+    command: ["--config", "/jaeger/config.yaml", "--feature-gates=storage.clickhouse"]
+    environment:
+      # Only used by the clickhouse storage profile.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-tracemap}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me-locally}
     volumes:
       # One env var swaps the storage backend. Depending on an alpha feature
       # (native ClickHouse) is acceptable; depending on it with no tested
@@ -107,6 +143,11 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.158.0
     command: ["--config", "/etc/otel/collector-gateway-config.yaml"]
+    environment:
+      # The clickhouse exporter reads these via ${env:...} in the config.
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-tracemap}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-tracemap}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me-locally}
     volumes:
       - ./otel:/etc/otel:ro
       - otelqueue:/var/lib/otelcol/queue    # M15 - persistent sending queue
@@ -115,6 +156,7 @@ services:
       - "13133:13133"     # health_check
     depends_on:
       volume-init: { condition: service_completed_successfully }
+      clickhouse: { condition: service_healthy }
       jaeger: { condition: service_started }
     healthcheck:
       test: ["CMD", "/otelcol-contrib", "--version"]
@@ -262,5 +304,6 @@ services:
 
 volumes:
   pgdata:
+  chdata:
   jaegerdata:
   otelqueue:

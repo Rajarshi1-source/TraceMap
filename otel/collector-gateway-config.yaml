@@ -112,6 +112,26 @@ exporters:
       enabled: true
       max_elapsed_time: 300s
 
+  # TraceMap's own analytics store. Separate from Jaeger's database (M16): we
+  # never read or build on Jaeger's tables, so a Jaeger upgrade cannot break
+  # the analytics tier.
+  clickhouse:
+    endpoint: tcp://clickhouse:9000?dial_timeout=10s
+    database: ${env:CLICKHOUSE_DB}
+    username: ${env:CLICKHOUSE_USER}
+    password: ${env:CLICKHOUSE_PASSWORD}
+    traces_table_name: otel_spans
+    # create_schema: false -- clickhouse/schema/ owns every table, so the whole
+    # schema applies deterministically to an empty server and nothing is created
+    # implicitly at first write. Retention for the landing table is set in
+    # 07_retention.sql (24h), not here.
+    create_schema: false
+    sending_queue:
+      enabled: true
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+
   prometheus:
     endpoint: 0.0.0.0:8889
 
@@ -139,7 +159,7 @@ service:
     traces/storage:
       receivers: [otlp]
       processors: [memory_limiter, filter/drop_probes, tail_sampling, batch]
-      exporters: [otlp/jaeger]
+      exporters: [otlp/jaeger, clickhouse]
 
     metrics/spanmetrics:
       receivers: [spanmetrics]

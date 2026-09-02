@@ -48,11 +48,19 @@ extensions:
     backends:
       main_store:
         clickhouse:
-          connection:
-            endpoint: tcp://clickhouse:9000
-            database: jaeger
-            username: ${env:CLICKHOUSE_USER:-default}
-            password: ${env:CLICKHOUSE_PASSWORD:-}
+          # The accepted keys are addresses / database / auth / tls /
+          # dial_timeout / create_schema / ttl. They were determined by probing
+          # the binary, because an alpha backend's config surface is not
+          # something to guess at.
+          addresses: [clickhouse:9000]
+          database: jaeger
+          auth:
+            basic:
+              username: ${env:CLICKHOUSE_USER}
+              password: ${env:CLICKHOUSE_PASSWORD}
+          dial_timeout: 10s
+          # Jaeger owns and creates its own tables in its own database. We never
+          # read them (M16).
           create_schema: true
 
 receivers:
