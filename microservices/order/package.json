@@ -1,0 +1,20 @@
+{
+  "name": "tracemap-order-svc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Order service - orchestrates the concurrent fan-out that makes critical-path attribution demonstrable",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "opossum": "^9.0.0",
+    "pg": "^8.13.1"
+  }
+}

@@ -31,7 +31,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18+ expects a single mount at /var/lib/postgresql, NOT at
+      # /var/lib/postgresql/data. The image stores data in a major-version
+      # subdirectory so `pg_upgrade --link` works without crossing a mount
+      # boundary; mounting the old path makes it refuse to start.
+      - pgdata:/var/lib/postgresql
       - ./microservices/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     ports: ["5432:5432"]
     healthcheck:
@@ -87,6 +91,11 @@ services:
       PGUSER: ${POSTGRES_USER:-tracemap}
       PGPASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
       PGDATABASE: ${POSTGRES_DB:-tracemap}
+    # Ports are published for local development and for the eval harness, which
+    # drives /_internal/fault on these services. The Helm chart in Phase 7 does
+    # NOT expose them: the fault control plane must never be reachable from a
+    # public ingress.
+    ports: ["3001:3001"]
     depends_on:
       postgres: { condition: service_healthy }
       user-svc: { condition: service_healthy }
@@ -112,6 +121,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-tracemap}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    ports: ["8000:8000"]
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:
@@ -161,6 +171,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-tracemap}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
       POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+    ports: ["8080:8080"]
     depends_on:
       postgres: { condition: service_healthy }
     healthcheck:

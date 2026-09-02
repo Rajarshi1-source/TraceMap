@@ -1,0 +1,24 @@
+# Normalise to LF in the repository.
+* text=auto eol=lf
+
+# These MUST be LF even on a Windows checkout. A shell script or Dockerfile
+# with CRLF fails inside a Linux container with a confusing error
+# ("/bin/sh^M: bad interpreter"), and the cause is invisible in an editor.
+*.sh            text eol=lf
+*.bash          text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+Makefile        text eol=lf
+*.mk            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.sql           text eol=lf
+*.py            text eol=lf
+*.go            text eol=lf
+*.js            text eol=lf
+*.ts            text eol=lf
+*.tsx           text eol=lf
+*.json          text eol=lf
+
+# Skill archives are generated binaries (ADR 0007) - never diff or merge them.
+*.skill         binary
