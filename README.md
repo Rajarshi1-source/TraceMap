@@ -97,6 +97,7 @@ make fanout-guard
 | [`schema-and-queries.md`](schema-and-queries.md) | ClickHouse DDL and the four production queries |
 | [`eval-harness.md`](eval-harness.md) | The golden set, runner and CI quality gate |
 | [`starter-code.md`](starter-code.md) | Week 1–4 scaffold |
+| [`docs/build-plan.html`](docs/build-plan.html) | The build plan as a styled page — same content as `IMPLEMENTATION_PLAN.md` |
 | `skills/` | Project rules, packed to `.claude/skills/*.skill` by `make skills` |
 
 `.claude/skills/*.skill` are **build artifacts**. Edit `skills/<name>/SKILL.md`

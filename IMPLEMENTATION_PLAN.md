@@ -16,6 +16,24 @@ a matter of taste.
 
 Audit performed 2026-09-02 against commit `abeef8d`.
 
+## Build status
+
+| Phase | State | Evidence |
+|---|---|---|
+| **0 — Repo bootstrap** | ✅ **Done** (`5e22e2a`) | 3/3 exit criteria verified |
+| **1 — Traced application** | ✅ **Done** (`c4653ee`) | 5/5 exit criteria verified against the running stack |
+| 2 — Instrumentation + Jaeger | In progress | |
+| 3 — ClickHouse tier | Not started | |
+| 4 — Critical path ⭐ | Not started | |
+| 5 — API + dashboard | Not started | |
+| 6 — Detector + deploy attribution | Not started | |
+| 7 — Eval harness + CI ⭐ | Not started | |
+| 8 — Docs + polish | Not started | |
+
+Phase 1 measured: **19.67 req/s, 0.08% error rate, p95 128ms**. Checkout p95 sits
+below the 165 ms that sequential downstream time alone would cost, so M1 holds at
+system level as well as in the unit test.
+
 ---
 
 ## Contents
@@ -284,6 +302,56 @@ except RecursionError:
 Three documents exist at the root *and* inside `.skill` archives, byte-identical
 today. Editing either copy creates a silent fork, and the skill copy is the one
 an agent loads. See §8 D4.
+
+
+---
+
+## 2b. Found while building (Phases 0–1)
+
+Three environment defects that the documents did not anticipate. All three are
+fixed in the repository; they are recorded here because each would stop a fresh
+clone dead, and the first two contradict what `starter-code.md` still says.
+
+### F5 — 🔴 PostgreSQL 18 moved its data mount
+
+`starter-code.md` §3 mounts the volume at `/var/lib/postgresql/data`. On
+PostgreSQL 18 the container **refuses to start**:
+
+```
+Error: in 18+, these Docker images are configured to store database data in a
+       format which is compatible with "pg_ctlcluster" ... there appears to be
+       PostgreSQL data in: /var/lib/postgresql/data (unused mount/volume)
+```
+
+18+ expects a **single mount at `/var/lib/postgresql`** and stores data in a
+major-version subdirectory, so `pg_upgrade --link` works without crossing a
+mount boundary. Fixed in `docker-compose.yml`; `starter-code.md` still carries
+the old path and should be corrected before Phase 3 copies from it.
+
+### F6 — 🔴 `asyncpg` has no Python 3.14 wheel
+
+`pip install asyncpg` on `python:3.14-slim` falls back to a source build and
+fails with `error: [Errno 2] No such file or directory: 'gcc'`. Adding a
+compiler to the runtime image is the wrong fix — it inflates the image and the
+CVE surface for a build-time need.
+
+Both Python services now use **`psycopg[binary,pool]` 3.2.10**, which ships
+wheels, has first-class async support, and keeps the image slim. The pool is
+bounded (`max_size=10`) per service, which is the bulkhead pattern the plan
+already calls for.
+
+### F7 — 🟡 The Go build was not reproducible
+
+The first Dockerfile ran `go mod tidy` at build time with no committed
+`go.sum`, so every build resolved dependency versions afresh. `go.mod` and
+`go.sum` are now committed and the build runs `go mod download`, which verifies
+against recorded checksums.
+
+### Not a defect, but worth writing down
+
+**GNU make is not bundled with Git for Windows.** The Makefile is the interface
+every phase's exit criteria are expressed in. `winget install ezwinports.make`
+provides it; the README says so.
 
 ---
 
