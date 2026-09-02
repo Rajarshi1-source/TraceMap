@@ -189,3 +189,56 @@ def test_normalisation_leaves_well_formed_traces_untouched():
     original = sorted(traces["t1"], key=lambda s: s.span_id)
     normalised = sorted(normalize_spans(traces["t1"]), key=lambda s: s.span_id)
     assert original == normalised
+
+
+# ---------------------------------------------------------------------------
+# LIMITATIONS.md 2 and 4 - previously documented, now implemented.
+# ---------------------------------------------------------------------------
+def test_async_producer_work_is_excluded_explicitly_not_silently_zeroed():
+    """A fire-and-forget PRODUCER span outlives the request it came from.
+
+    The walk would give it 0ms anyway, so why exclude it deliberately? Because a
+    deliberate zero and an accidental zero look identical in the database, and
+    only one of them is a statement about the system. If the algorithm ever
+    changes such that a long async span WOULD land on the path, this keeps the
+    answer correct rather than lucky.
+
+    The edge is still written with 0.0 (M5): the call really happened.
+    """
+    rows = [
+        _row("root", "",     "gateway-svc", "POST /checkout", 0,  100),
+        _row("pay",  "root", "payment-svc", "charge",         5,  95),
+        # publish returns immediately but its subtree runs long
+        _row("pub",  "root", "gateway-svc", "publish",        5,  10),
+        _row("wrk",  "pub",  "worker-svc",  "consume",        6,  99),
+    ]
+    kinds = {"root": "SERVER", "pay": "SERVER", "pub": "PRODUCER", "wrk": "CONSUMER"}
+    traces = rows_to_traces(rows)
+    edge_rows, _ = assemble_trace("t1", traces["t1"], kinds)
+    blame = {(e["source_service"], e["target_service"]): e["critical_ms"]
+             for e in edge_rows}
+
+    assert blame[("gateway-svc", "worker-svc")] == 0.0
+    assert ("gateway-svc", "worker-svc") in blame, "the async edge must still be drawn"
+    assert blame[("gateway-svc", "payment-svc")] > 80, "sync work still gets blame"
+
+
+def test_sub_skew_contributions_are_floored_to_zero():
+    """Clock drift between hosts is a few ms. Reporting 0.4ms of 'blame' claims
+    a precision the timestamps do not have, so anything under the floor becomes
+    a clean zero."""
+    from workers.trace_assembler_worker import SKEW_FLOOR_MS
+
+    rows = [
+        _row("root", "",     "gw",    "GET /x", 0,   100),
+        _row("tiny", "root", "svc-a", "a",      98,  99),    # ~1ms, under floor
+        _row("big",  "root", "svc-b", "b",      5,   97),
+    ]
+    edge_rows, _ = assemble_trace("t1", rows_to_traces(rows)["t1"], {})
+    blame = {(e["source_service"], e["target_service"]): e["critical_ms"]
+             for e in edge_rows}
+
+    assert SKEW_FLOOR_MS == 2.0
+    assert blame[("gw", "svc-a")] == 0.0, "a sub-floor contribution must read 0.0"
+    assert ("gw", "svc-a") in blame
+    assert blame[("gw", "svc-b")] > 2.0

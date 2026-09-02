@@ -35,6 +35,13 @@ LATE_SPAN_GRACE_S = int(os.environ.get("LATE_SPAN_GRACE_S", "30"))
 
 LOOKBACK_MINUTES = int(os.environ.get("ASSEMBLE_LOOKBACK_MINUTES", "10"))
 
+# Contributions below this are indistinguishable from clock skew between hosts
+# and are floored to zero. A few milliseconds of drift between pods is normal;
+# at short durations that noise is a meaningful fraction of the measurement, and
+# reporting 0.4ms of "blame" implies a precision the timestamps do not have.
+# LIMITATIONS.md section 4.
+SKEW_FLOOR_MS = float(os.environ.get("CRITICAL_PATH_SKEW_FLOOR_MS", "2.0"))
+
 # ---------------------------------------------------------------------------
 # Exactly-once processing, via a watermark on trace completion time.
 #
@@ -106,6 +113,13 @@ ORDER BY trace_id, start_time_unix_ns
 """
 
 
+def rows_to_kinds(rows: list[dict]) -> dict[str, str]:
+    """span_id -> span kind. Kept OUTSIDE the Span dataclass on purpose:
+    critical_path.py is reproduced verbatim and adding a field to Span would be
+    a rewrite of a file whose six tests are the specification."""
+    return {r["span_id"]: (r.get("span_kind") or "").upper() for r in rows}
+
+
 def rows_to_traces(rows: list[dict]) -> dict[str, list[Span]]:
     """Group fetched rows into per-trace span lists.
 
@@ -128,6 +142,44 @@ def rows_to_traces(rows: list[dict]) -> dict[str, list[Span]]:
         )
         by_trace.setdefault(r["trace_id"], {})[span.span_id] = span
     return {tid: list(spans.values()) for tid, spans in by_trace.items()}
+
+
+def descendants_of(spans: list[Span], roots: set[str]) -> set[str]:
+    """Every span at or below `roots`."""
+    children: dict[str, list[str]] = {}
+    for s in spans:
+        children.setdefault(s.parent_span_id, []).append(s.span_id)
+    out, stack = set(), list(roots)
+    while stack:
+        sid = stack.pop()
+        if sid in out:
+            continue
+        out.add(sid)
+        stack.extend(children.get(sid, ()))
+    return out
+
+
+def split_async(spans: list[Span], kinds: dict[str, str]) -> tuple[list[Span], set[str]]:
+    """Separate fire-and-forget work from the request's critical path.
+
+    A PRODUCER span - a queue publish, a background write - can outlive the
+    request that spawned it. It is genuinely not on the user's critical path, so
+    the walk would attribute it 0ms anyway. The difference is that EXCLUDING it
+    is explainable and letting it be silently zeroed is not: a deliberate zero
+    and an accidental zero look identical in the database, and only one of them
+    is a statement about the system.
+
+    The producer's whole subtree goes with it - that subtree IS the async work.
+    Its edges are still written, with critical_ms = 0.0 (M5), so the map draws
+    them and fades them rather than pretending the call never happened.
+
+    LIMITATIONS.md section 2.
+    """
+    producers = {sid for sid, k in kinds.items() if k == "PRODUCER"}
+    if not producers:
+        return spans, set()
+    excluded = descendants_of(spans, producers)
+    return [s for s in spans if s.span_id not in excluded], excluded
 
 
 def normalize_spans(spans: list[Span]) -> list[Span]:
@@ -189,20 +241,35 @@ def normalize_spans(spans: list[Span]) -> list[Span]:
     return list(fixed.values())
 
 
-def assemble_trace(trace_id: str, spans: list[Span]) -> tuple[list[dict], list[dict]]:
+def assemble_trace(
+    trace_id: str,
+    spans: list[Span],
+    kinds: dict[str, str] | None = None,
+) -> tuple[list[dict], list[dict]]:
     """Turn one trace into its edge rows and its critical-path row."""
+    spans = normalize_spans(spans)
+
+    # Async work is removed from the PATH computation but stays in the edge
+    # rows: the call happened, it just did not make the user wait.
+    path_spans, async_ids = split_async(spans, kinds or {})
+
     # F3 - attribute_to_edges recurses in _depth() at the same tree depth, so it
     # belongs INSIDE the guard, not after it. A trace deep enough to blow the
     # stack must skip cleanly rather than kill the cycle.
-    spans = normalize_spans(spans)
     try:
-        segments = compute_critical_path(spans)
+        segments = compute_critical_path(path_spans)
         if not segments:
             return [], []
-        crit_by_edge = attribute_to_edges(spans, segments)
+        crit_by_edge = attribute_to_edges(path_spans, segments)
     except RecursionError:
         log.warning("trace %s too deep; skipping", trace_id)
         return [], []
+
+    # Floor sub-skew contributions to zero rather than reporting a precision the
+    # clocks cannot support.
+    crit_by_edge = {
+        k: (0.0 if v < SKEW_FLOOR_MS else v) for k, v in crit_by_edge.items()
+    }
 
     by_id = {s.span_id: s for s in spans}
     bucket = min(s.start_ns for s in spans) // 1_000_000_000
@@ -224,7 +291,10 @@ def assemble_trace(trace_id: str, spans: list[Span]) -> tuple[list[dict], list[d
                 "duration_ms": s.duration_ms,
                 # M5: a parallel sibling gets 0.0 and the row is STILL written.
                 # The map needs it to fade the edge out rather than drop it.
-                "critical_ms": crit_by_edge.get((parent.service, s.service), 0.0),
+                "critical_ms": (
+                    0.0 if s.span_id in async_ids
+                    else crit_by_edge.get((parent.service, s.service), 0.0)
+                ),
                 "is_error": int(s.is_error),
                 "target_version": s.version,
             }
@@ -274,6 +344,7 @@ async def assemble_once(ch: ClickHouseClient, wm: Watermark) -> int:
         },
     )
     traces = rows_to_traces(rows)
+    kinds = rows_to_kinds(rows)
     if not traces:
         return 0
 
@@ -284,7 +355,7 @@ async def assemble_once(ch: ClickHouseClient, wm: Watermark) -> int:
     edge_rows: list[dict] = []
     path_rows: list[dict] = []
     for trace_id, spans in traces.items():
-        e, p = assemble_trace(trace_id, spans)
+        e, p = assemble_trace(trace_id, spans, kinds)
         edge_rows.extend(e)
         path_rows.extend(p)
 

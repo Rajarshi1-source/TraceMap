@@ -1,0 +1,75 @@
+"""Redis: graph cache, single-flight lock, and the staleness signal.
+
+Three jobs, and the third is the one people skip.
+
+The graph is recomputed by a worker every 10s and read from cache by the API in
+under 2ms. When the analytics tier is degraded the cache keeps serving the last
+good graph - and the payload says so, because silently stale numbers are worse
+than none. An operator who cannot tell fresh from stale will trust the wrong
+one at exactly the wrong moment.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any
+
+import redis.asyncio as aioredis
+
+GRAPH_KEY = "graph:current"
+GRAPH_LOCK = "graph:lock"
+
+# Longer than the builder's interval so a single slow cycle does not empty the
+# cache, short enough that genuinely stale data is flagged quickly.
+GRAPH_TTL_S = int(os.environ.get("GRAPH_CACHE_TTL_S", "60"))
+LOCK_TTL_S = int(os.environ.get("GRAPH_LOCK_TTL_S", "10"))
+
+# Past this age the payload is marked stale and the UI shows a banner.
+STALE_AFTER_S = int(os.environ.get("GRAPH_STALE_AFTER_S", "30"))
+
+
+class Cache:
+    def __init__(self, url: str | None = None) -> None:
+        self.redis = aioredis.from_url(
+            url or os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            decode_responses=True,
+        )
+
+    async def close(self) -> None:
+        await self.redis.aclose()
+
+    async def ping(self) -> bool:
+        try:
+            return bool(await self.redis.ping())
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ---- graph ------------------------------------------------------------
+    async def put_graph(self, graph: dict[str, Any]) -> None:
+        graph["computedAt"] = time.time()
+        await self.redis.set(GRAPH_KEY, json.dumps(graph), ex=GRAPH_TTL_S)
+
+    async def get_graph(self) -> dict[str, Any] | None:
+        raw = await self.redis.get(GRAPH_KEY)
+        if not raw:
+            return None
+        graph = json.loads(raw)
+        age = time.time() - graph.get("computedAt", 0)
+        graph["ageSeconds"] = round(age, 1)
+        graph["stale"] = age > STALE_AFTER_S
+        return graph
+
+    # ---- single-flight ----------------------------------------------------
+    async def acquire_lock(self) -> bool:
+        """SET NX EX - atomic, so exactly one replica recomputes.
+
+        Without it every replica rebuilds the graph on the same cadence and they
+        all hammer ClickHouse together. The lock TTL is shorter than the build
+        interval so a crashed holder cannot wedge the cache.
+        """
+        return bool(await self.redis.set(GRAPH_LOCK, "1", nx=True, ex=LOCK_TTL_S))
+
+    async def release_lock(self) -> None:
+        await self.redis.delete(GRAPH_LOCK)

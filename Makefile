@@ -37,6 +37,8 @@ logs: ## Tail logs from the core profile
 
 demo: up seed ## Boot core and pre-load traffic - use this before a screen-share
 	@echo ""
+	@echo "  Dashboard  http://localhost:3002"
+	@echo "  Jaeger UI  http://localhost:16686"
 	@echo "  Gateway    http://localhost:3000"
 	@echo ""
 
@@ -70,7 +72,10 @@ profile-matrix: ## Phase 3 - boot every Jaeger storage profile and prove traces 
 critical-path-guard: ## Phase 4 - the flagship: parallel siblings score 0, payment does not
 	@python scripts/critical-path-guard.py
 
-guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard ## Run every invariant guard
+api-guard: ## Phase 5 - assert the graph API contract and latency budget
+	@python scripts/api-guard.py
+
+guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard api-guard ## Run every invariant guard
 
 skills: ## Rebuild .claude/skills/*.skill from skills/ (D4 - archives are artifacts)
 	@python scripts/build-skills.py

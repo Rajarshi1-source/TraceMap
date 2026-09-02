@@ -321,6 +321,70 @@ services:
     restart: unless-stopped
     profiles: [core, full, eval]
 
+  analytics-api:
+    build: ./platform
+    command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment: &platform-env
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-tracemap}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-tracemap}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me-locally}
+      REDIS_URL: redis://redis:6379/0
+      GIT_SHA: ${GIT_SHA:-dev-local}
+      CORS_ORIGINS: http://localhost:3002
+    ports:
+      - "8090:8090"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz',timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
+  graph-builder:
+    build: ./platform
+    command: ["python", "-m", "workers.graph_builder_worker"]
+    environment:
+      <<: *platform-env
+      METRICS_PORT: 9101
+      GRAPH_BUILD_INTERVAL_S: ${GRAPH_BUILD_INTERVAL_S:-10}
+    ports:
+      - "9101:9101"
+    # The image's default healthcheck probes 9100 (the assembler's port). This
+    # worker serves metrics on 9101, so the probe is overridden rather than
+    # making the Dockerfile guess which worker it is running.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9101/metrics',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
+  dashboard:
+    build: ./dashboard
+    environment:
+      # Server components talk to the API inside the network; the browser talks
+      # to it through the published port.
+      ANALYTICS_API_URL: http://analytics-api:8090
+      NEXT_PUBLIC_API_BASE: http://localhost:8090
+    ports:
+      - "3002:3002"
+    depends_on:
+      analytics-api: { condition: service_healthy }
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
 volumes:
   pgdata:
   chdata:

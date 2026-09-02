@@ -35,13 +35,21 @@ so the algorithm attributes it 0ms. That is *correct for latency* and
 *misleading for correctness*: the work matters, it just does not make the user
 wait.
 
-**Mitigation.** Detect `span.kind = PRODUCER` and exclude it explicitly, rather
-than letting it be silently zeroed. A deliberate exclusion is explainable; an
-accidental zero is indistinguishable from a bug.
+**Mitigation — implemented.** `split_async()` in the assembler removes
+`span.kind = PRODUCER` spans *and their subtrees* from the critical-path
+computation. The subtree goes too, because that subtree **is** the async work.
 
-**Still open.** The demo application has no async fan-out, so this path is
-unexercised. The exclusion is documented here rather than implemented, and that
-distinction is deliberate — see the note on untested fallbacks in ADR 0002.
+Why exclude something the walk would score 0.0 anyway: a deliberate zero and an
+accidental zero look identical in the database, and only one of them is a
+statement about the system. If the walk ever changes such that a long async span
+*would* land on the path, this keeps the answer correct rather than lucky.
+
+The edge is still written with `critical_ms = 0.0` (M5) — the call really
+happened, and the map should fade it, not delete it.
+
+**Still open.** The demo application has no async fan-out, so this runs only
+against the unit test `test_async_producer_work_is_excluded_explicitly_not_silently_zeroed`,
+not against live traffic. Tested, not yet exercised in production.
 
 ---
 
@@ -67,15 +75,17 @@ trace is *excluded* rather than silently mis-attributed. Not built.
 hosts carry different clocks, and a few milliseconds of skew is normal. At short
 durations that noise is a meaningful fraction of the measurement.
 
-**Mitigation.** Floor contributions below ~2ms to zero, and monitor skew from
-span timestamps. Segments are contiguous and sum exactly to the root duration
+**Mitigation — implemented.** `SKEW_FLOOR_MS = 2.0` in the assembler floors any
+contribution below the threshold to a clean `0.0`. Reporting "0.4 ms of blame"
+claims a precision the timestamps do not have. Segments also remain contiguous
+and sum exactly to the root duration
 (`test_critical_path_covers_the_root_span_exactly`), so gross skew shows up as a
 broken invariant rather than a plausible wrong number.
 
-**Still open.** The 2ms floor is not yet applied in the assembler. On a
-single-node deployment there is no cross-host skew to correct, which is why it
-has not bitten — and is exactly why it must be written down before this runs on
-more than one machine.
+**Still open.** Skew itself is not yet *measured* — there is no panel showing
+drift between hosts, so the floor is a mitigation without an instrument. On a
+single-node deployment there is no cross-host skew to see, which is precisely
+why this must stay written down before the stack runs on more than one machine.
 
 ---
 
@@ -133,3 +143,13 @@ Everything outside that sentence — async work, multi-host skew, heavily sample
 blame shares, badly incomplete traces — is either mitigated above or listed as
 open. The number is not universally true, and saying so is what makes the cases
 where it *is* true worth believing.
+
+### Status
+
+| # | Caveat | State |
+|---|---|---|
+| 1 | Sampling skews attribution | Mitigated; unbiased-slice maths not built |
+| 2 | Async work | **Implemented** and unit-tested; not exercised live |
+| 3 | Missing spans | Orphan-tolerant root; completeness scoring not built |
+| 4 | Clock skew | **Implemented** (2 ms floor); skew not yet measured |
+| 5 | Malformed nesting | **Fixed and tested**, both directions |

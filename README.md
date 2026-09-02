@@ -19,11 +19,12 @@ order-svc            |------------------------------------- 730ms --|
 
 Making `product-svc` infinitely fast would save the user nothing.
 
-> **Status: Phase 2 of 8 complete.** Five services are traced end to end through
-> an OpenTelemetry collector into Jaeger v2.20. The analytics tier and the
-> critical-path engine land in Phases 3 and 4. See
+> **Status: Phase 5 of 8 complete.** Five traced services → OpenTelemetry
+> collector → Jaeger v2.20 and ClickHouse → critical-path assembler → a
+> dependency map with the wall-clock ⇄ critical-path toggle. Detection, the
+> eval harness and deployment remain. See
 > [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the build order, exit
-> criteria and the defects found along the way.
+> criteria and the fifteen defects found along the way.
 
 ---
 
@@ -35,9 +36,16 @@ make up       # boot the core profile
 make smoke    # end-to-end check through all five services
 ```
 
-Then open **http://localhost:16686** for the Jaeger UI. `make demo` seeds 60s of
-traffic first, because a demo that opens on an empty graph is a demo you have
-already lost.
+Then open:
+
+| | |
+|---|---|
+| **http://localhost:3002** | the dependency map — flip the metric toggle |
+| http://localhost:16686 | Jaeger, for the trace waterfall |
+| http://localhost:8090/api/graph | the raw graph payload |
+
+`make demo` seeds 60s of traffic first, because a demo that opens on an empty
+graph is a demo you have already lost.
 
 `make` on its own lists every target.
 

@@ -375,9 +375,9 @@ footer{
   <dl class="metastrip">
     <div><dt>Implementation code found</dt><dd>0 <small>lines</small></dd></div>
     <div><dt>Algorithm tests run</dt><dd>6 / 6 <small>pass</small></dd></div>
-    <div><dt>Defects found</dt><dd>15 <small>all verified &amp; fixed</small></dd></div>
+    <div><dt>Defects found</dt><dd>18 <small>all verified &amp; fixed</small></dd></div>
     <div><dt>Binding mandates</dt><dd>30</dd></div>
-    <div><dt>Phases shipped</dt><dd>5 / 9 <small>0-4 verified</small></dd></div>
+    <div><dt>Phases shipped</dt><dd>6 / 9 <small>0-5 verified</small></dd></div>
   </dl>
 
   <div class="tw" style="margin-top:26px">
@@ -389,8 +389,8 @@ footer{
         <tr><td><strong>2 — Instrumentation + Jaeger</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; one 28-span trace across all five services</td></tr>
         <tr><td><strong>3 — ClickHouse tier</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; 14 objects from an empty server, both storage profiles boot</td></tr>
         <tr><td><strong>4 — Critical path ⭐</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified live; product-svc 47ms wall clock, <strong>0ms blame</strong></td></tr>
-        <tr><td>5 — API + dashboard</td><td><span class="pill acc">Next</span></td><td></td></tr>
-        <tr><td>6 — Detector + deploy attribution</td><td>Not started</td><td></td></tr>
+        <tr><td><strong>5 — API + dashboard</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified; the toggle fades the parallel edge, positions drift 1.14px across polls</td></tr>
+        <tr><td>6 — Detector + deploy attribution</td><td><span class="pill acc">Next</span></td><td></td></tr>
         <tr><td>7 — Eval harness + CI ⭐</td><td>Not started</td><td></td></tr>
         <tr><td>8 — Docs + polish</td><td>Not started</td><td></td></tr>
       </tbody>
@@ -615,6 +615,26 @@ product-svc | SPAN_KIND_SERVER | GET /products  = <span class="bad">0</span></co
   <h3><span class="pill warn">F9</span> &nbsp;.env pinned a stale GIT_SHA</h3>
   <p><code>make env</code> refused to touch an existing <code>.env</code>, so <code>GIT_SHA</code> stayed at whatever HEAD was when the file was created — two commits later every span still carried the old SHA. Caught only because the trace guard compares <code>service.version</code> against <code>git rev-parse</code>.</p>
   <p><strong>A stale <code>service.version</code> is worse than a missing one:</strong> Phase 6 deploy attribution would confidently name the wrong commit, and the alert would look authoritative while pointing at an innocent change.</p>
+
+  <h3 style="margin-top:38px">Found while building — Phase 5</h3>
+
+  <h3><span class="pill crit">F16</span> &nbsp;Next.js standalone binds to $HOSTNAME, which Docker sets</h3>
+  <p>The dashboard served fine through its published port and <strong>failed its own healthcheck</strong>. Next's standalone <code>server.js</code> binds to <code>process.env.HOSTNAME</code>, and Docker sets that to the container ID — so it bound to the container's own hostname rather than all interfaces, and anything hitting <code>127.0.0.1</code> inside the container got <code>ECONNREFUSED</code>. The dangerous part is that it looks fine from outside. Fixed with <code>ENV HOSTNAME=0.0.0.0</code>.</p>
+
+  <h3><span class="pill warn">F17</span> &nbsp;Aliasing an aggregate to its own column name</h3>
+  <pre><code><span class="bad">Code: 184. Aggregate function sum(error_count) AS error_count is found
+inside another aggregate function</span></code></pre>
+  <p><code>sum(error_count) AS error_count</code> makes ClickHouse re-resolve the alias inside the next aggregate. Hit twice — once on the counters, once on <code>crit_ms_sum</code>. Cheap to fix, but it takes the whole graph query down.</p>
+
+  <h3><span class="pill warn">F18</span> &nbsp;Positions were only saved on simulation end</h3>
+  <p>d3-timer runs on <code>requestAnimationFrame</code>, which browsers throttle to nothing in a hidden tab — so a graph loaded in a background tab may never reach <code>"end"</code>, positions were never recorded, and the layout re-seeded from scratch on return. That is exactly the jump M25 exists to prevent, arriving by a route the mandate does not mention. Positions are now written every tick.</p>
+  <p>Found because the verification itself ran against a hidden browser pane and measured zero laid-out nodes — a decent argument for testing where the user actually is.</p>
+
+  <div class="callout">
+    <span class="tag">Two measurement notes, not defects</span>
+    <p><strong>The warm-latency budget is measured twice.</strong> In-container median <strong>2.51ms</strong>; from the host through Docker's port-forward ~9ms. The in-container figure is what the &lt;5ms criterion is about. Cold, against live ClickHouse: <strong>52ms</strong> of a 100ms budget.</p>
+    <p><strong><code>crit_p99</code> is outlier-sensitive by design.</strong> Over 26 traces <code>order→product</code> was on the critical path in exactly <em>one</em> — a trace where product genuinely finished last. That sets p99 at 47ms while the mean is 1.8ms against payment's 95.2ms. Correct per-trace behaviour; worth knowing before quoting a p99 in a demo.</p>
+  </div>
 
   <h3 style="margin-top:38px">Found while building — Phase 4</h3>
   <p>Four defects, all silent. None would have been caught by a green test suite over synthetic data — every one needed the thing running against real traces.</p>

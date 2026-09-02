@@ -25,7 +25,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **2 — Instrumentation + Jaeger** | ✅ **Done** | 6/6 verified; one 28-span trace across all five services |
 | **3 — ClickHouse tier** | ✅ **Done** | 6/6 verified; 14 objects from an empty server, both storage profiles boot |
 | **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
-| 5 — API + dashboard | Not started | |
+| **5 — API + dashboard** | ✅ **Done** | 7/7 verified; toggle fades the parallel edge, positions drift 1.14px across polls |
 | 6 — Detector + deploy attribution | Not started | |
 | 7 — Eval harness + CI ⭐ | Not started | |
 | 8 — Docs + polish | Not started | |
@@ -565,6 +565,65 @@ parse on the way back in. `toString()` is the correct call.
 were in the query string and `httpx` logs each request at INFO. Moved to
 `X-ClickHouse-*` headers and quieted the logger — a URL is the thing that ends
 up in logs, traces and error messages.
+
+
+---
+
+## 2f. Found while building (Phase 5)
+
+### F16 — 🔴 Next.js standalone binds to `$HOSTNAME`, which Docker sets
+
+The dashboard served fine through its published port and **failed its own
+healthcheck**. Next's standalone `server.js` binds to `process.env.HOSTNAME`,
+and Docker sets `HOSTNAME` to the container ID — so the server bound to the
+container's own hostname rather than all interfaces. Anything connecting to
+`127.0.0.1` inside the container, which is exactly what a healthcheck does, got
+`ECONNREFUSED`.
+
+The dangerous part is that it looks fine from outside. Fixed with
+`ENV HOSTNAME=0.0.0.0`.
+
+### F17 — 🟡 Aliasing an aggregate to its own column name
+
+`sum(error_count) AS error_count` makes ClickHouse re-resolve the alias inside
+the next aggregate and reject the query:
+
+```
+Code: 184. Aggregate function sum(error_count) AS error_count is found
+inside another aggregate function
+```
+
+Hit twice — once on the counters, once on `crit_ms_sum`. Distinct alias names
+(`requests`, `errors`, `crit_total_ms`) fix it. Cheap, but it takes the whole
+graph query down, so it is worth the note.
+
+### F18 — 🟡 Positions were only saved on `sim.on("end")`
+
+d3-timer runs on `requestAnimationFrame`, which browsers throttle to nothing in
+a hidden tab. A graph that loads in a background tab therefore may never reach
+`"end"` — so positions were never recorded, and the layout re-seeded from
+scratch when the user came back. That is precisely the jump M25 exists to
+prevent, arriving by a route the mandate does not mention.
+
+Positions are now written on every tick. Found because the verification itself
+ran against a hidden browser pane and measured zero laid-out nodes, which is a
+nice argument for testing where the user actually is rather than where it is
+convenient.
+
+### Two measurement notes, not defects
+
+**The warm-latency budget is measured twice.** In-container median is
+**2.51 ms**; from the host through Docker's port-forward it is ~9 ms. The
+in-container figure is the one the `< 5 ms` criterion is about — the forward is
+a Windows Docker artifact, not application latency. Cold (live ClickHouse) is
+**52 ms** against a 100 ms budget.
+
+**`crit_p99` is outlier-sensitive, by design.** Over 26 traces, `order→product`
+was on the critical path in exactly **one** — a trace where product genuinely
+finished last. That single trace sets the p99 at 47 ms while the mean is 1.8 ms
+against payment's 95.2 ms. The attribution is being honest per-trace rather than
+applying a blanket rule, which is the correct behaviour; it is worth knowing
+before quoting a p99 in a demo.
 
 ---
 
