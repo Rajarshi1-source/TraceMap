@@ -62,10 +62,23 @@ processors:
         latency:
           threshold_ms: 500
 
-      - name: keep-checkout-flow          # the demo path is always sampled
+      # The demo path is always sampled. Match on url.path, NOT http.route:
+      # http.route is only populated when the instrumentation resolves a route
+      # template, and the Express auto-instrumentation does not set it on the
+      # server span. Keying on it meant this policy silently never matched, so
+      # /checkout fell through to the 20% probabilistic baseline - the one path
+      # the whole demo depends on was being dropped four times out of five, with
+      # nothing to indicate it. http.target is the pre-1.0 semconv spelling and
+      # is kept so a mixed-SDK fleet still matches.
+      - name: keep-checkout-flow
         type: string_attribute
         string_attribute:
-          key: http.route
+          key: url.path
+          values: ["/checkout"]
+      - name: keep-checkout-flow-legacy
+        type: string_attribute
+        string_attribute:
+          key: http.target
           values: ["/checkout"]
 
       # M14 - keep this. Without an unbiased baseline, storage holds only errors

@@ -1,0 +1,135 @@
+# Limitations of critical-path attribution
+
+Naming the limits of your own idea is a stronger signal than the idea. These are
+the conditions under which TraceMap's flagship number is wrong, how each is
+mitigated, and which ones remain open.
+
+Volunteer these before being asked.
+
+---
+
+## 1. Sampling skews attribution
+
+**The problem.** Blame shares are computed over whatever traces were kept. Tail
+sampling deliberately keeps errors and slow traces, so a naive blame share is
+measured over a sample that is biased *toward* the very traces where one edge
+dominates. The number would overstate how often that edge is the bottleneck.
+
+**Mitigation.** The tail sampler keeps a `baseline-probabilistic` policy at 20%
+alongside the error and latency policies, specifically so an unbiased slice
+exists (M14). Measured in Phase 2: 100 browse requests produced 100 spanmetrics
+counts and 26 stored traces, which is that policy working.
+
+**Still open.** The API does not yet compute blame shares *only* from the
+unbiased slice, nor scale by adjusted counts. Until it does, quote per-edge
+`critical_ms` (which is per-trace and unaffected) rather than
+"share of total latency" (which is not).
+
+---
+
+## 2. Async work breaks the model
+
+**The problem.** A fire-and-forget span — a queue publish, a background write —
+can outlive the request that spawned it. It is not on the user's critical path,
+so the algorithm attributes it 0ms. That is *correct for latency* and
+*misleading for correctness*: the work matters, it just does not make the user
+wait.
+
+**Mitigation.** Detect `span.kind = PRODUCER` and exclude it explicitly, rather
+than letting it be silently zeroed. A deliberate exclusion is explainable; an
+accidental zero is indistinguishable from a bug.
+
+**Still open.** The demo application has no async fan-out, so this path is
+unexercised. The exclusion is documented here rather than implemented, and that
+distinction is deliberate — see the note on untested fallbacks in ADR 0002.
+
+---
+
+## 3. Missing spans distort the path
+
+**The problem.** A dropped intermediate span makes a grandchild look like a
+direct child, and the walk attributes time to the wrong hop. A dropped root
+leaves the trace with no obvious starting point.
+
+**Mitigation.** Root selection is orphan-tolerant: the earliest orphan is used
+when the true root is absent, because a partial answer beats a blank map. This
+is covered by `test_orphan_root_survives_a_dropped_parent`.
+
+**Still open.** Deeper gaps need trace-completeness scoring — comparing observed
+span count against an expected shape per route — so that a badly incomplete
+trace is *excluded* rather than silently mis-attributed. Not built.
+
+---
+
+## 4. Clock skew across nodes
+
+**The problem.** The maths assumes comparable timestamps. Spans from different
+hosts carry different clocks, and a few milliseconds of skew is normal. At short
+durations that noise is a meaningful fraction of the measurement.
+
+**Mitigation.** Floor contributions below ~2ms to zero, and monitor skew from
+span timestamps. Segments are contiguous and sum exactly to the root duration
+(`test_critical_path_covers_the_root_span_exactly`), so gross skew shows up as a
+broken invariant rather than a plausible wrong number.
+
+**Still open.** The 2ms floor is not yet applied in the assembler. On a
+single-node deployment there is no cross-host skew to correct, which is why it
+has not bitten — and is exactly why it must be written down before this runs on
+more than one machine.
+
+---
+
+## 5. Malformed nesting — found in production, not theory
+
+**The problem.** The walk assumes a child span lies inside its parent's window.
+Real instrumentation violates this. Express closes its `request handler` span a
+tick *after* the HTTP server span that contains it:
+
+```
+order-svc POST (SERVER)                [ 5.0 .. 122.6]
+  order-svc request handler /orders    [ 6.0 .. 122.8]   <-- 0.2 ms late
+```
+
+`_walk` skips any child ending after the cursor, because that is precisely how
+it recognises parallel work. So a child overrunning its parent by a fraction of
+a millisecond takes its **entire subtree** with it. Measured on the real demo
+trace before the fix:
+
+| edge | wall clock | attributed |
+|---|---|---|
+| order-svc → payment-svc | 98.8 ms | **0.0 ms** |
+| order-svc → product-svc | 46.8 ms | 0.0 ms |
+| order-svc → user-svc | 34.3 ms | 0.0 ms |
+
+Every downstream edge scored zero. Nothing errored. The flagship number just
+quietly became meaningless on the one trace the project exists to explain.
+
+**Mitigation.** `normalize_spans()` in the assembler clamps every span inside
+its parent's window before the walk runs. This is normalisation of malformed
+input, **not** a change to the algorithm — `critical_path.py` stays verbatim and
+its six tests stay green. A span that outlives its own parent is not a fact
+about the system; it is an artifact of two instrumentation layers rounding
+differently. After the fix, the same trace attributes 98.8 ms to payment and
+0.0 ms to the parallel siblings.
+
+Guarded by `test_child_outliving_its_parent_does_not_erase_the_subtree`, and by
+a companion test asserting the clamp is a no-op on well-formed traces — so it
+cannot start quietly rewriting good data.
+
+**Still open.** Nothing. This one is fixed and tested.
+
+---
+
+## What this means for the claim
+
+The defensible statement is narrow:
+
+> *For synchronous request-response traces, on a single host, with the sampling
+> policies documented in `otel/collector-gateway-config.yaml`, an edge's
+> `critical_ms` is the number of user-visible milliseconds that edge
+> contributed.*
+
+Everything outside that sentence — async work, multi-host skew, heavily sampled
+blame shares, badly incomplete traces — is either mitigated above or listed as
+open. The number is not universally true, and saying so is what makes the cases
+where it *is* true worth believing.

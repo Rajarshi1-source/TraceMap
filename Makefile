@@ -50,6 +50,7 @@ smoke: ## End-to-end smoke test against a running stack
 test: ## Run every service's unit tests
 	cd microservices/order && npm test
 	cd microservices/product && go test ./...
+	cd platform && python -m pytest -q
 
 fanout-guard: ## M1 - prove the checkout fan-out is concurrent, not sequential
 	cd microservices/order && npm test -- fanout
@@ -66,7 +67,10 @@ schema-guard: ## Phase 3 - assert the ClickHouse DDL invariants (M2/M3, F1, M4, 
 profile-matrix: ## Phase 3 - boot every Jaeger storage profile and prove traces land
 	./scripts/profile-matrix.sh
 
-guards: fanout-guard probe-guard trace-guard schema-guard ## Run every invariant guard
+critical-path-guard: ## Phase 4 - the flagship: parallel siblings score 0, payment does not
+	@python scripts/critical-path-guard.py
+
+guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard ## Run every invariant guard
 
 skills: ## Rebuild .claude/skills/*.skill from skills/ (D4 - archives are artifacts)
 	@python scripts/build-skills.py

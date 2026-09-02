@@ -122,6 +122,15 @@ CREATE TABLE IF NOT EXISTS tracemap.spans
     attributes          Map(String, String),
     resource_attributes Map(String, String),
 
+    -- When the row ARRIVED, not when the span happened. The assembler needs to
+    -- ask "have any new spans for this trace turned up in the last 30s?", and
+    -- span timestamps cannot answer that: by the time a span is written it is
+    -- already ~20s old (collector batch + tail-sampling decision_wait +
+    -- export). Grace-checking on span time therefore declares a trace complete
+    -- while a second batch is still in flight, and the assembler computes a
+    -- critical path over half a tree.
+    ingested_at         DateTime DEFAULT now() CODEC(Delta, ZSTD(1)),
+
     INDEX idx_trace_id trace_id       TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_parent   parent_span_id TYPE bloom_filter(0.01) GRANULARITY 4
 )

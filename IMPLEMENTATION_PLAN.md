@@ -24,7 +24,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **1 — Traced application** | ✅ **Done** (`c4653ee`) | 5/5 exit criteria verified against the running stack |
 | **2 — Instrumentation + Jaeger** | ✅ **Done** | 6/6 verified; one 28-span trace across all five services |
 | **3 — ClickHouse tier** | ✅ **Done** | 6/6 verified; 14 objects from an empty server, both storage profiles boot |
-| 4 — Critical path ⭐ | Not started | |
+| **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
 | 5 — API + dashboard | Not started | |
 | 6 — Detector + deploy attribution | Not started | |
 | 7 — Eval harness + CI ⭐ | Not started | |
@@ -481,6 +481,90 @@ experimental and must be explicitly enabled. The schema is subject to breaking
 changes."* That message is the justification for the whole profile mechanism.
 `scripts/profile-matrix.sh` now boots each profile and asserts traces land, so
 the fallback is tested rather than merely claimed.
+
+
+---
+
+## 2e. Found while building (Phase 4)
+
+Four defects, all silent. None would have been caught by a green test suite over
+synthetic data — every one needed the thing running against real traces.
+
+### F12 — 🔴 A child span outliving its parent erased its entire subtree
+
+The flagship number read **zero on the real demo path**, and nothing errored.
+
+Express closes its `request handler` span a tick *after* the HTTP server span
+that contains it:
+
+```
+order-svc POST (SERVER)                [ 5.0 .. 122.6]
+  order-svc request handler /orders    [ 6.0 .. 122.8]   <-- 0.2 ms late
+```
+
+`_walk` skips any child ending after the cursor, because that is exactly how it
+recognises parallel work. So a 0.2 ms overrun took the **whole subtree** with it:
+payment, product and user all scored 0.0. Measured before and after on the same
+trace: 9 segments → 30, and `order→payment` 0.0 ms → 98.1 ms.
+
+Fixed with `normalize_spans()` in the assembler, which clamps every span inside
+its parent's window. That is normalisation of malformed input, **not** a change
+to the algorithm: `critical_path.py` stays verbatim and its six tests stay green.
+A span outliving its own parent is not a fact about the system, it is an
+artifact of two instrumentation layers rounding differently. Guarded both ways —
+one test proves the subtree survives, another proves the clamp is a no-op on
+well-formed traces so it cannot quietly rewrite good data.
+
+### F13 — 🔴 The demo path was never actually always-sampled
+
+The tail-sampling policy meant to guarantee `/checkout` is always kept:
+
+```yaml
+- name: keep-checkout-flow
+  string_attribute: { key: http.route, values: ["/checkout"] }
+```
+
+**never matched.** The Express instrumentation sets `url.path=/checkout`, not
+`http.route` — the latter is only populated when a route template is resolved.
+So the one path the entire demo depends on fell through to the 20% probabilistic
+baseline and was dropped four times in five, with nothing to indicate it.
+
+Measured: 1 multi-service trace stored in five minutes. After keying on
+`url.path` (with `http.target` retained for older SDKs): **13 stored for 12
+sent**.
+
+This had been visible since Phase 2 — `http.route` never appeared as a
+spanmetrics dimension — and was noted but not chased. The lesson is the cheap
+one: an attribute that is silently absent looks identical to an attribute that
+is present and empty.
+
+### F14 — 🟡 The same trace was assembled by consecutive cycles
+
+24 of 40 distinct edges were written twice. Duplicate rows inflate
+`request_count` in the incremental MV, quietly undoing the F1 fix that Phase 3
+exists to guarantee. Fixed with a completion-time watermark. Note that a
+`ReplacingMergeTree` would **not** have helped: its dedup happens at merge time,
+long after the MV has already fired on both inserts.
+
+### F15 — 🟡 Grace was measured on span time, not ingestion time
+
+A span is already ~20 s old when it lands (collector batch + `decision_wait` +
+export), so a 30 s grace on span time declares a trace complete while a later
+batch is still in flight — and the assembler then attributes a critical path
+over half a tree. Fixed by adding `ingested_at DEFAULT now()` to
+`tracemap.spans` and asking the question that actually matters: *has any new
+span for this trace arrived recently?*
+
+### Two smaller ones, worth a line each
+
+**`formatDateTime('%M')` returns the month name**, not minutes — ClickHouse
+follows MySQL here. The watermark serialised as `19:September:24` and failed to
+parse on the way back in. `toString()` is the correct call.
+
+**The ClickHouse client leaked its password into every log line.** Credentials
+were in the query string and `httpx` logs each request at INFO. Moved to
+`X-ClickHouse-*` headers and quieted the logger — a URL is the thing that ends
+up in logs, traces and error messages.
 
 ---
 

@@ -302,6 +302,25 @@ services:
       timeout: 3s
       retries: 12
 
+  # ------------------------------------------------------------------ platform
+  trace-assembler:
+    build: ./platform
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-tracemap}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-tracemap}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-change-me-locally}
+      ASSEMBLE_INTERVAL_S: ${ASSEMBLE_INTERVAL_S:-15}
+      LATE_SPAN_GRACE_S: ${LATE_SPAN_GRACE_S:-30}
+      METRICS_PORT: 9100
+    ports:
+      - "9100:9100"     # heartbeat + worker metrics
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
 volumes:
   pgdata:
   chdata:

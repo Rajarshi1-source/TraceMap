@@ -375,9 +375,9 @@ footer{
   <dl class="metastrip">
     <div><dt>Implementation code found</dt><dd>0 <small>lines</small></dd></div>
     <div><dt>Algorithm tests run</dt><dd>6 / 6 <small>pass</small></dd></div>
-    <div><dt>Defects found</dt><dd>11 <small>all verified &amp; fixed</small></dd></div>
+    <div><dt>Defects found</dt><dd>15 <small>all verified &amp; fixed</small></dd></div>
     <div><dt>Binding mandates</dt><dd>30</dd></div>
-    <div><dt>Phases shipped</dt><dd>4 / 9 <small>0-3 verified</small></dd></div>
+    <div><dt>Phases shipped</dt><dd>5 / 9 <small>0-4 verified</small></dd></div>
   </dl>
 
   <div class="tw" style="margin-top:26px">
@@ -388,8 +388,8 @@ footer{
         <tr><td><strong>1 — Traced application</strong></td><td><span class="pill ok">Done</span> <code>c4653ee</code></td><td>5 / 5 verified against the running stack</td></tr>
         <tr><td><strong>2 — Instrumentation + Jaeger</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; one 28-span trace across all five services</td></tr>
         <tr><td><strong>3 — ClickHouse tier</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; 14 objects from an empty server, both storage profiles boot</td></tr>
-        <tr><td>4 — Critical path ⭐</td><td><span class="pill acc">Next</span></td><td></td></tr>
-        <tr><td>5 — API + dashboard</td><td>Not started</td><td></td></tr>
+        <tr><td><strong>4 — Critical path ⭐</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified live; product-svc 47ms wall clock, <strong>0ms blame</strong></td></tr>
+        <tr><td>5 — API + dashboard</td><td><span class="pill acc">Next</span></td><td></td></tr>
         <tr><td>6 — Detector + deploy attribution</td><td>Not started</td><td></td></tr>
         <tr><td>7 — Eval harness + CI ⭐</td><td>Not started</td><td></td></tr>
         <tr><td>8 — Docs + polish</td><td>Not started</td><td></td></tr>
@@ -615,6 +615,32 @@ product-svc | SPAN_KIND_SERVER | GET /products  = <span class="bad">0</span></co
   <h3><span class="pill warn">F9</span> &nbsp;.env pinned a stale GIT_SHA</h3>
   <p><code>make env</code> refused to touch an existing <code>.env</code>, so <code>GIT_SHA</code> stayed at whatever HEAD was when the file was created — two commits later every span still carried the old SHA. Caught only because the trace guard compares <code>service.version</code> against <code>git rev-parse</code>.</p>
   <p><strong>A stale <code>service.version</code> is worse than a missing one:</strong> Phase 6 deploy attribution would confidently name the wrong commit, and the alert would look authoritative while pointing at an innocent change.</p>
+
+  <h3 style="margin-top:38px">Found while building — Phase 4</h3>
+  <p>Four defects, all silent. None would have been caught by a green test suite over synthetic data — every one needed the thing running against real traces.</p>
+
+  <h3><span class="pill crit">F12</span> &nbsp;A child outliving its parent erased its entire subtree</h3>
+  <p>The flagship number read <strong>zero on the real demo path</strong>, and nothing errored. Express closes its <code>request handler</code> span a tick after the HTTP span containing it:</p>
+  <pre><code>order-svc POST (SERVER)                [ 5.0 .. 122.6]
+  order-svc request handler /orders    [ 6.0 .. 122.8]   <span class="bad">&lt;-- 0.2 ms late</span></code></pre>
+  <p><code>_walk</code> skips any child ending after the cursor — that is exactly how it recognises parallel work. So a 0.2 ms overrun took the <strong>whole subtree</strong> with it: payment, product and user all scored 0.0. On the same trace: 9 segments → 30, and <code>order→payment</code> 0.0 ms → 98.1 ms.</p>
+  <p>Fixed by clamping every span inside its parent's window in the assembler — normalisation of malformed input, <strong>not</strong> a change to the algorithm, which stays verbatim with its six tests green. Guarded both ways: one test proves the subtree survives, another proves the clamp is a no-op on well-formed traces.</p>
+
+  <h3><span class="pill crit">F13</span> &nbsp;The demo path was never actually always-sampled</h3>
+  <p>The policy meant to guarantee <code>/checkout</code> is always kept keyed on <code>http.route</code>. Express sets <code>url.path</code> instead, so it <strong>never matched</strong> — the one path the demo depends on fell through to the 20% baseline and was dropped four times in five.</p>
+  <p>Measured: <strong>1</strong> multi-service trace stored in five minutes. After keying on <code>url.path</code>: <strong>13 stored for 12 sent</strong>. This had been visible since Phase 2 and was noted but not chased. An attribute that is silently absent looks identical to one that is present and empty.</p>
+
+  <h3><span class="pill warn">F14</span> &nbsp;The same trace was assembled twice</h3>
+  <p>24 of 40 edges written twice, inflating <code>request_count</code> in the incremental MV and quietly undoing the F1 fix Phase 3 exists to guarantee. Fixed with a completion-time watermark. A <code>ReplacingMergeTree</code> would <em>not</em> have helped — its dedup happens at merge time, after the MV has fired on both inserts.</p>
+
+  <h3><span class="pill warn">F15</span> &nbsp;Grace measured span time, not ingestion time</h3>
+  <p>A span is ~20s old when it lands, so a 30s grace on span time declares a trace complete while a later batch is in flight, and the assembler attributes over half a tree. Fixed with <code>ingested_at DEFAULT now()</code>.</p>
+
+  <div class="callout">
+    <span class="tag">Two smaller ones</span>
+    <p><strong><code>formatDateTime('%M')</code> returns the month name</strong>, not minutes — ClickHouse follows MySQL. The watermark serialised as <code>19:September:24</code>.</p>
+    <p><strong>The ClickHouse client leaked its password into every log line.</strong> Credentials were in the query string and httpx logs each request at INFO. Moved to headers — a URL is the thing that ends up in logs and error messages.</p>
+  </div>
 
   <h3 style="margin-top:38px">Found while building — Phase 3</h3>
 
