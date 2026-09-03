@@ -1,0 +1,28 @@
+name: payment_latency_60ms
+family: latency
+description: >
+  The canonical case from the brief: +60ms on payment-svc /charge, which sits
+  on the critical path of every checkout. Payment is the slowest fan-out leg at
+  a 90ms baseline, so the added time lands on the critical path in full.
+
+  60ms is deliberately close to the 50ms threshold. It is the sensitivity
+  floor -- the smallest fault the detector is claimed to catch -- and therefore
+  the case most sensitive to a mis-armed baseline (F21).
+injector:
+  type: latency
+  target: payment-svc
+  endpoint: /charge
+  delay_ms: 60
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  # Siblings only. gateway-svc->order-svc is NOT a trap: payment is inside the
+  # order subtree, so the order edge genuinely did get slower and saying so is
+  # correct attribution, not a false positive.
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

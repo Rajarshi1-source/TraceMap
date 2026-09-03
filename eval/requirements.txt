@@ -1,0 +1,10 @@
+# The harness runs OUTSIDE the stack it measures -- on a laptop or a CI runner,
+# not in a container alongside the detector. Keeping this list separate from
+# platform/requirements.txt is what makes that possible: the eval suite must be
+# installable without installing the thing it judges.
+httpx==0.28.1
+PyYAML==6.0.3
+redis==6.4.0
+psycopg[binary,pool]==3.2.10
+pytest==8.4.2
+pytest-asyncio==1.2.0

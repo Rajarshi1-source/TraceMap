@@ -1,0 +1,126 @@
+{{/*
+Public ingress: Traefik (bundled with k3s) plus cert-manager for TLS.
+
+The rule that matters is the last one. Read paths are public so the dependency
+map can be shown to anyone with the link; every path that MUTATES state sits
+behind basic auth.
+
+An unauthenticated write API on the public internet, linked from a CV, is not
+a demonstration of anything except that nobody thought about it. Two of the
+write paths here are worse than the usual case:
+
+  /_internal/*   the fault control plane. Anyone reaching it can make the
+                 production services slow on demand.
+  /api/rollback  triggers a Deployment rollback. A Slack button payload is
+                 user input crossing a trust boundary into a cluster-mutating
+                 call (M22), and the same is true of an HTTP body.
+*/}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tracemap.fullname" . }}
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.tls.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: analytics-api
+                port:
+                  number: {{ .Values.analyticsApi.port }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dashboard
+                port:
+                  number: {{ .Values.dashboard.port }}
+{{- if .Values.ingress.auth.enabled }}
+---
+{{/*
+Traefik middleware chain for the write paths.
+
+A separate Ingress rather than a path exclusion on the one above: expressing
+"public except these prefixes" as a negation is how a new write endpoint ends
+up public because nobody remembered to add it to the list. Here the default is
+closed and each protected prefix is named.
+*/}}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "tracemap.fullname" . }}-auth
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  basicAuth:
+    secret: {{ .Values.ingress.auth.secretName }}
+    removeHeader: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "tracemap.fullname" . }}-ratelimit
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    # Write endpoints are low-volume by nature. A rate limit here is not about
+    # capacity, it is about making credential-stuffing and accidental loops
+    # expensive.
+    average: 10
+    burst: 20
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "tracemap.fullname" . }}-protected
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.ingress.tls.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.clusterIssuer }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      {{ .Release.Namespace }}-{{ include "tracemap.fullname" . }}-auth@kubernetescrd,{{ .Release.Namespace }}-{{ include "tracemap.fullname" . }}-ratelimit@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.auth.protectedPaths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: analytics-api
+                port:
+                  number: {{ $.Values.analyticsApi.port }}
+          {{- end }}
+{{- end }}
+{{- end }}

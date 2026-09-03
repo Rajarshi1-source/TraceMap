@@ -1,0 +1,62 @@
+name: parallel_decoy
+family: decoy
+description: >
+  THE case. Two services are made slow at once inside the same concurrent
+  fan-out: user-svc by +100ms (45 -> ~145 wall p99) and payment-svc by +150ms
+  (154 -> ~304). Both jump far past the 50ms threshold on wall clock. Only
+  payment is on the critical path, because user-svc finishes ~160ms earlier and
+  order-svc was waiting on payment the whole time.
+
+  A wall-clock detector alerts on both and books a false positive. A
+  critical-path detector alerts on payment alone. That difference is the entire
+  argument for the flagship feature, and this file is where the argument stops
+  being rhetoric and becomes a number.
+
+  WHY user-svc AND NOT product-svc. The reference harness uses product-svc as
+  the decoy. Measured against this application, that is wrong, and it fails in
+  a way that looks like a detector bug:
+
+    edge                    critical on   crit p99
+    order-svc->payment-svc      87.3%       157ms
+    order-svc->product-svc      12.4%        49ms   <- NOT a parallel sibling
+    order-svc->user-svc          0.3%         0ms   <- the real one
+
+  product-svc has an N+1 query path that fires on carts above
+  PRODUCT_N_PLUS_ONE_THRESHOLD, and roughly a fifth of generated carts cross
+  it. On those traces product genuinely IS the slowest leg and genuinely does
+  carry blame. So injecting into product raises its critical p99 by the
+  injected amount, a critical-path detector correctly alerts on it, and the
+  case scores a false positive against a detector that did exactly the right
+  thing. Measured: +120ms on product moved its critical p99 from 49.3 to
+  168.8 and tripped the trap at t+202s.
+
+  user-svc has no such path. It is the cheapest leg, it is never the slowest,
+  and its critical p99 is a measured 0.0 -- which is what a parallel sibling
+  actually looks like.
+
+  The margin is deliberate and it has to clear the DECOY'S OWN critical-path
+  baseline, not merely its mean latency. See test_the_decoy_case_survives.
+injector:
+  type: composite
+  parts:
+    - type: latency
+      target: user-svc
+      endpoint: /users
+      delay_ms: 100
+      duration_s: 600
+    - type: latency
+      target: payment-svc
+      endpoint: /charge
+      delay_ms: 150
+      duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  must_not_alert:
+    # The decoy. Genuinely slow, genuinely traced, and genuinely irrelevant to
+    # how long the customer waited.
+    - "order-svc->user-svc"
+    - "order-svc->product-svc"

@@ -179,7 +179,7 @@ SLOs for the platform itself — this is the part that reads as SRE thinking:
 |---|---|---|
 | Span ingestion completeness | >= 99.9% stored | Dropped spans are silent blind spots |
 | Graph freshness | 95% of renders under 60s stale | The consistency budget |
-| Detector MTTD | 95% of injected faults under 180s | Measured continuously |
+| Detector MTTD | 95% of injected faults under 432s | Measured continuously; 180s is below the detector's own 3-cycle confirmation floor before any pipeline time |
 | Detector precision | >= 90% | Alert fatigue is a human availability problem |
 | MV/reconciler agreement | within 2% | Guards the materialized-view bug class |
 

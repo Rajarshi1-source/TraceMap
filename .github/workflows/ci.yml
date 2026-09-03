@@ -1,0 +1,264 @@
+name: ci
+
+# Everything that must be true of every commit, and nothing that takes an hour.
+# The detector eval lives in eval.yml because a 45-minute gate on every PR
+# trains people to route around CI, and a gate people avoid is worse than no
+# gate at all (D5).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # M24: service.version rides on every span from day one. Injected at build
+  # time so a container can say which commit produced it without asking git.
+  GIT_SHA: ${{ github.sha }}
+
+jobs:
+  # ------------------------------------------------------------------ static
+  lint:
+    name: lint and typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: install python tooling
+        run: |
+          python -m pip install --quiet ruff mypy
+          python -m pip install --quiet -r platform/requirements.txt
+          python -m pip install --quiet -r eval/requirements.txt
+      - run: ruff check platform eval scripts
+      - name: mypy
+        run: mypy --ignore-missing-imports platform/src eval
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: eslint and tsc
+        run: |
+          cd dashboard && npm ci && npx tsc --noEmit
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: cd microservices/product && go vet ./...
+
+  # ------------------------------------------------------------------- tests
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: order-svc, including the fan-out guard
+        # M1. If this ever passes with a sequential fan-out, every edge lands
+        # on the critical path, wall clock and critical path become identical,
+        # and the flagship feature has nothing left to demonstrate -- while
+        # nothing else in the suite fails.
+        run: cd microservices/order && npm ci && npm test
+
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.26" }
+      - run: cd microservices/product && go test ./...
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - name: platform tests, including the M6 baseline guard
+        run: |
+          python -m pip install --quiet -r platform/requirements.txt pytest pytest-asyncio
+          cd platform && python -m pytest -q
+
+      - name: eval harness tests
+        # These are the ones that prove the GATE works: a deliberately broken
+        # detector's results must fail scoring, and the regression check must
+        # refuse a missing run and a cross-tier comparison. Exit criterion 5,
+        # as a test rather than a screenshot.
+        run: |
+          python -m pip install --quiet -r eval/requirements.txt
+          python -m pytest eval/tests -q -c eval/pytest.ini --rootdir=.
+
+  # --------------------------------------------------------------- invariants
+  guards:
+    name: invariant guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - run: python -m pip install --quiet -r eval/requirements.txt
+      - name: ClickHouse DDL invariants (M2, M3, M4, M16, F1)
+        run: python scripts/schema-guard.py
+      - name: the eval gate goes red on a broken detector
+        # Exit criterion 5, on every commit rather than as a screenshot from
+        # one afternoon. Feeds the scorer and the regression CLI the results
+        # each way of breaking the detector would produce, and fails if any of
+        # them come out green. Needs no stack, so it runs here rather than in
+        # the eval workflow.
+        run: python scripts/eval-gate-guard.py
+      - name: skill archives are not stale
+        run: python scripts/build-skills.py --check
+      - name: no Jaeger v1 manifests (M10)
+        # v1 has been EOL since 31 Dec 2025. A v1 manifest in this repo would
+        # be quoted at some point, and quoting it is disqualifying.
+        run: |
+          if grep -rIl --exclude-dir=.git --exclude=*.md \
+               -e 'jaegertracing/all-in-one' \
+               -e 'apiVersion: jaegertracing.io/v1' . ; then
+            echo "::error::Jaeger v1 manifest found (M10)"; exit 1
+          fi
+      - name: no EOL base images (M18)
+        # Node 20 went EOL in April 2026.
+        run: |
+          if grep -rIn --include=Dockerfile --include=*.yml --include=*.yaml \
+               -e 'node:20' -e 'node:18' -e 'python:3.9' . ; then
+            echo "::error::EOL base image found (M18)"; exit 1
+          fi
+
+  # ------------------------------------------------------------------- build
+  build:
+    name: build and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, order, user, payment, product]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        id: img
+        with:
+          context: microservices/${{ matrix.service }}
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.service }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ------------------------------------------------------- storage fallback
+  storage-profile-matrix:
+    name: storage profile (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # This is what turns "I have a fallback" into "my fallback is tested".
+    # An untested fallback is worse than none: it invites confidence that has
+    # never been checked, which is the failure ADR 0002 exists to prevent.
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [clickhouse, badger]
+    steps:
+      - uses: actions/checkout@v4
+      - name: boot with STORAGE_PROFILE=${{ matrix.profile }}
+        run: |
+          make env
+          STORAGE_PROFILE=${{ matrix.profile }} \
+            docker compose --profile core up -d --wait
+      - run: ./scripts/smoke-test.sh
+      - name: prove traces land in this profile
+        run: ./scripts/profile-matrix.sh ${{ matrix.profile }}
+      - if: always()
+        run: docker compose --profile core logs --tail=120
+
+  # ----------------------------------------------------------------- k6 SLO
+  k6-slo-gate:
+    name: k6 SLO gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make env && docker compose --profile core up -d --wait
+      - name: warm up
+        # The first thirty seconds include JIT, connection-pool fill and cold
+        # caches. Measuring them would make the SLO a statement about process
+        # startup rather than about the service.
+        run: |
+          docker run --rm --network tracemap_default \
+            -v "$PWD/load-testing:/scripts" \
+            -e SHORT=1 -e RPS=10 -e DURATION=30s \
+            -e BASE_URL=http://gateway-svc:3000 \
+            grafana/k6 run /scripts/normal-checkout-flow.js
+      - name: measure at 50 rps
+        run: |
+          docker run --rm --network tracemap_default \
+            -v "$PWD/load-testing:/scripts" -v "$PWD:/out" \
+            -e SHORT=1 -e RPS=50 -e DURATION=120s \
+            -e BASE_URL=http://gateway-svc:3000 \
+            grafana/k6 run --summary-export=/out/k6-summary.json \
+            /scripts/normal-checkout-flow.js
+      - name: enforce the SLO
+        run: |
+          P95=$(jq -r '.metrics.http_req_duration["p(95)"]' k6-summary.json)
+          ERR=$(jq -r '.metrics.http_req_failed.value' k6-summary.json)
+          echo "p95=${P95}ms  error_rate=${ERR}"
+          awk -v p="$P95" -v e="$ERR" 'BEGIN{exit !(p < 400 && e < 0.01)}' || {
+            echo "::error::SLO gate failed - p95=${P95}ms (<400) err=${ERR} (<0.01)"
+            exit 1
+          }
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-summary
+          path: k6-summary.json
+      - if: always()
+        run: docker compose --profile core logs --tail=120
+
+  # ------------------------------------------------------------------- helm
+  helm:
+    name: helm lint and template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/tracemap
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - name: render, then assert the invariants
+        # Checked against the RENDERED manifests rather than the values file,
+        # because the failure mode is a template that puts a readiness path
+        # into a liveness probe -- which values-level review cannot see.
+        # scripts/probe-guard.sh proves the same thing at runtime by actually
+        # stopping Postgres; this is the static half that runs without a
+        # cluster.
+        run: |
+          python -m pip install --quiet PyYAML
+          helm template tracemap charts/tracemap > /tmp/rendered.yaml
+          python scripts/helm-guard.py --manifest /tmp/rendered.yaml

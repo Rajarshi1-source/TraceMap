@@ -17,10 +17,17 @@ class Fault:
     delay_ms: int = 0
     error_rate: float = 0.0
     cpu_burn_ms: int = 0
+    # Dependency-kill (eval case 010). Severs THIS service's path to its own
+    # database, which is what a NetworkPolicy would do. Stopping the shared
+    # Postgres container instead would inject four faults at once and make
+    # attribution meaningless.
+    dep_down: bool = False
+    dep_timeout_ms: int = 250
 
     @property
     def active(self) -> bool:
-        return bool(self.delay_ms or self.error_rate or self.cpu_burn_ms)
+        return bool(self.delay_ms or self.error_rate or self.cpu_burn_ms
+                    or self.dep_down)
 
 
 NO_FAULT = Fault()
@@ -34,6 +41,11 @@ def _int(name: str, default: int) -> int:
 def _float(name: str, default: float) -> float:
     raw = os.environ.get(name, "")
     return float(raw) if raw.strip() else default
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    return raw in ("1", "true", "yes") if raw else default
 
 
 class FaultConfig:
@@ -55,6 +67,8 @@ class FaultConfig:
             delay_ms=_int("TRACEMAP_FAULT_DELAY_MS", 0),
             error_rate=_float("TRACEMAP_FAULT_ERROR_RATE", 0.0),
             cpu_burn_ms=_int("TRACEMAP_FAULT_CPU_BURN_MS", 0),
+            dep_down=_bool("TRACEMAP_FAULT_DEP_DOWN", False),
+            dep_timeout_ms=_int("TRACEMAP_FAULT_DEP_TIMEOUT_MS", 250),
         )
         if fault.active:
             self.set(fault, self._endpoint, _int("TRACEMAP_FAULT_TTL_S", 600))
@@ -87,6 +101,8 @@ class FaultConfig:
             "delay_ms": f.delay_ms,
             "error_rate": f.error_rate,
             "cpu_burn_ms": f.cpu_burn_ms,
+            "dep_down": f.dep_down,
+            "dep_timeout_ms": f.dep_timeout_ms,
         }
 
 

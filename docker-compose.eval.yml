@@ -1,0 +1,92 @@
+# Overlay for eval runs:  docker compose -f docker-compose.yml -f docker-compose.eval.yml
+#
+# What this file deliberately does NOT do is speed the pipeline up.
+#
+# It is tempting. Shortening the collector batch, the sampling decision wait and
+# the assembler grace would take roughly forty seconds off a four-hundred-second
+# budget, and every one of those knobs is already an environment variable. The
+# reason not to is that the only claim worth making about an MTTD number is that
+# it was measured against the configuration that actually ships. A detector
+# scored on a faster pipeline than production has been scored on a system nobody
+# runs, and the number stops meaning what the sentence quoting it implies.
+#
+# So the overlay does the opposite job: it PINS the detector's configuration to
+# the documented values, so a stray `.env` on a laptop cannot silently change
+# the thing being measured between one run and the next. Every value here is
+# the default from the pin ledger, written out rather than inherited.
+
+services:
+  anomaly-detector:
+    environment:
+      # The model artifact. `eval_runs.detector_cfg` records these per run, so
+      # any score change is attributable to a config change or it is drift.
+      DETECTOR_ALPHA: "0.2"
+      DETECTOR_THRESHOLD_MS: "50"
+      # The floor stays at 100. A laptop at 20 rps produces roughly 840 checkout
+      # calls per minute-bucket on the fan-out edges, comfortably clear of it.
+      # Lowering it to make a low-traffic run detect faster would change what
+      # the score measures, and any number quoted afterwards would have to say
+      # so -- which is exactly the caveat that gets dropped in the retelling.
+      DETECTOR_MIN_REQUESTS: "100"
+      DETECTOR_SUSTAINED_CYCLES: "3"
+      # Fixed, not learned. Zero is the target for errors in a way it never is
+      # for latency, so an EWMA here would make a persistently broken service
+      # read as healthy. 2% against a measured healthy floor of ~0.08%.
+      DETECTOR_ERROR_RATE_THRESHOLD: "0.02"
+      DETECTOR_WARMUP_CYCLES: "5"
+      DETECT_INTERVAL_S: "60"
+      # Alerts must not leave the machine during an eval run. Twelve injected
+      # faults would otherwise page a channel with incidents nobody declared.
+      SLACK_WEBHOOK_URL: ""
+      AUTO_ROLLBACK_ENABLED: "false"
+
+  # The runner executes OUTSIDE the stack -- on a laptop or a CI runner -- so it
+  # needs a route to Redis to clear the detector's alert-suppression state
+  # between cases. Redis is deliberately unpublished in the `core` profile,
+  # because an unauthenticated Redis on a host port is not something to ship by
+  # default. The eval overlay is the right place to open it: the harness needs
+  # it, and the overlay is never the production topology.
+  #
+  # Without this the reset degrades to a no-op and cases 003 and 006 -- which
+  # both fault `order-svc->payment-svc` inside one 600s dedup TTL -- guarantee
+  # a false negative on the second one. The scoreboard would be measuring
+  # Redis, and it would read as a detector regression.
+  redis:
+    ports:
+      # 56379, not 6379. The harness runs on whatever machine is to hand, and a
+      # developer machine frequently already has Redis or Postgres listening on
+      # the default port. A native service that wins the bind is worse than a
+      # port conflict, because compose reports success and the runner silently
+      # talks to the wrong database -- measured here: a local PostgreSQL 17
+      # service owned 5432, the container published it anyway, and every
+      # connection from the host authenticated against the wrong server.
+      - "${EVAL_REDIS_PORT:-56379}:6379"
+
+  postgres:
+    ports:
+      - "${EVAL_POSTGRES_PORT:-55432}:5432"
+
+  trace-assembler:
+    environment:
+      ASSEMBLE_INTERVAL_S: "15"
+      LATE_SPAN_GRACE_S: "30"
+
+  # Background load for the whole run, on the compose network rather than the
+  # host's. `--network host` behaves differently on Docker Desktop, and a load
+  # generator that silently reaches nothing turns every case into a false
+  # negative -- failure mode #1 in the harness table, and the one that looks
+  # most like a broken detector.
+  load-generator:
+    image: grafana/k6:latest
+    profiles: [eval]
+    depends_on:
+      gateway-svc: { condition: service_healthy }
+    volumes:
+      - ./load-testing:/scripts:ro
+    environment:
+      SHORT: "1"
+      RPS: ${EVAL_RPS:-20}
+      DURATION: ${EVAL_LOAD_DURATION:-9000s}
+      BASE_URL: http://gateway-svc:3000
+    command: ["run", "/scripts/normal-checkout-flow.js"]
+    restart: unless-stopped

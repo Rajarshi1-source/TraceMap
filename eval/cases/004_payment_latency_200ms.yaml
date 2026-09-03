@@ -1,0 +1,22 @@
+name: payment_latency_200ms
+family: latency
+description: >
+  +200ms on payment-svc /charge. Four times the threshold, so the breach is
+  unambiguous and only the sustained-window and pipeline lag stand between
+  injection and alert. If this one is slow, the budget is the pipeline's, not
+  the detector's -- which is the distinction the MTTD number has to survive.
+injector:
+  type: latency
+  target: payment-svc
+  endpoint: /charge
+  delay_ms: 200
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

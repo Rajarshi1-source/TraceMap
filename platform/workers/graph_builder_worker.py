@@ -17,11 +17,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+
+from prometheus_client import Gauge
 
 from src.cache.redis_cache import Cache
 from src.core.query_engine import QueryEngine
 from src.integrations.clickhouse_client import ClickHouseClient
 from workers._runner import run_forever, serve_metrics
+
+# Backs the GraphStaleness alert. The dashboard shows a staleness banner when
+# it knows the data is old (M26); this catches the case the banner cannot --
+# the API cheerfully serving a cached graph that nothing has refreshed. Set on
+# a successful build only, so a failing builder shows as an ageing timestamp
+# rather than as a fresh one.
+GRAPH_BUILT = Gauge(
+    "tracemap_graph_built_timestamp_seconds",
+    "Unix time the dependency map was last rebuilt",
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +52,7 @@ async def build_once(engine: QueryEngine, cache: Cache) -> int:
         graph = await engine.graph(GRAPH_WINDOW_MIN)
         graph["windowMinutes"] = GRAPH_WINDOW_MIN
         await cache.put_graph(graph)
+        GRAPH_BUILT.set(time.time())
         log.info("graph rebuilt: %d nodes, %d edges",
                  len(graph["nodes"]), len(graph["edges"]))
         return len(graph["edges"])

@@ -1,0 +1,207 @@
+name: detector-eval
+
+# The quality gate for the detector, treated as a model.
+#
+# Two tiers, and the split is a design decision rather than a concession to the
+# clock (D5). The full set takes roughly ninety minutes: twelve cases, most of
+# them running until they detect plus a trap-grace window, with a settling gap
+# between each and a five-minute baseline warm-up in front. Ninety minutes on
+# every PR trains people to route around CI, and a gate people avoid is worse
+# than no gate at all.
+#
+#   smoke   4 cases, ~45 min, on PRs that touch detector paths
+#   full    12 cases, ~110 min, nightly on main
+#
+# The four smoke cases are chosen to cover each failure mode the gate exists to
+# catch, not simply the fastest four:
+#   001 null     false positives -- the measurement everyone forgets
+#   003 latency  sensitivity at the threshold, the canonical brief case
+#   006 decoy    the flagship; a wall-clock detector fails it by design
+#   007 errors   the error path, which latency percentiles cannot see
+#
+# Any score quoted anywhere must name its tier. Smoke-tier and full-set
+# precision are computed over different case mixes and are different numbers.
+
+on:
+  pull_request:
+    paths:
+      - "platform/src/core/**"
+      - "platform/workers/**"
+      - "otel/**"
+      - "eval/**"
+      - "clickhouse/schema/**"
+      - ".github/workflows/eval.yml"
+  schedule:
+    - cron: "0 3 * * *"   # nightly drift check on main
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: full or smoke
+        type: choice
+        options: [smoke, full]
+        default: full
+
+concurrency:
+  # Never two eval runs at once on the same ref. Two runs mean two sets of
+  # injected faults against one stack, and concurrent faults make attribution
+  # ambiguous -- the same reason the runner refuses to parallelise cases.
+  group: eval-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  eval:
+    name: golden set (${{ github.event_name == 'pull_request' && 'smoke' || 'full' }})
+    runs-on: ubuntu-latest
+    # 110 minutes for the full set is not padding. Ten fault cases running to
+    # detection plus a 90s trap grace, two null cases holding 600s each, eleven
+    # 60s settling gaps and a 5-minute warm-up. A timeout tighter than the
+    # measurement cancels runs and the cancellations read as flakiness.
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 70 || 140 }}
+    env:
+      TIER: ${{ github.event.inputs.tier || (github.event_name == 'pull_request' && 'smoke' || 'full') }}
+      GIT_SHA: ${{ github.sha }}
+      ANALYTICS_API: http://localhost:8090
+      DEPLOY_CONTROL: http://localhost:9103
+      REDIS_URL: redis://localhost:6379/0
+      POSTGRES_HOST: localhost
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.14" }
+      - run: python -m pip install --quiet -r eval/requirements.txt
+
+      - name: validate the golden set before booting anything
+        # Cheap, and it fails in seconds rather than ninety minutes. A case
+        # naming an edge the application cannot produce would otherwise run a
+        # real fault, watch for an alert that can never arrive, and score a
+        # working detector as a false negative.
+        run: python -m pytest eval/tests -q -c eval/pytest.ini --rootdir=.
+
+      - name: boot the stack
+        run: |
+          make env
+          docker compose -f docker-compose.yml -f docker-compose.eval.yml \
+            --profile eval up -d --wait
+
+      - name: warm the baselines
+        # Five warmup cycles at 60s, plus pipeline lag. Skip this and the
+        # warmup gate suppresses every case -- failure mode #1 in the harness
+        # table, and the one that looks most like a broken detector.
+        run: |
+          echo "warming for 6 minutes so every edge clears its warmup gate"
+          sleep 360
+          curl -sf "http://localhost:8090/api/graph?window=5" | head -c 400
+
+      - name: the declared topology still matches the live graph
+        # Structural drift invalidates the case files before it invalidates
+        # any score. A leg that has started carrying critical-path blame
+        # cannot be the decoy at any delay, and case 006 would then fail
+        # against a detector doing exactly the right thing.
+        run: python scripts/topology-guard.py
+
+      - name: run the golden set
+        run: |
+          python -m eval.runner \
+            --tier "$TIER" \
+            --git-sha "${{ github.sha }}" \
+            --output eval-report.md \
+            --json eval-run.json
+
+      - name: comment the scoreboard on the PR
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: detector-eval
+          path: eval-report.md
+
+      - name: fail on regression
+        # Separate from the runner's own pass/fail. The runner asks "is this
+        # detector good enough in absolute terms"; this asks "is it worse than
+        # main". A detector that was always mediocre passes the first and fails
+        # nothing; one that dropped from excellent to merely good fails this.
+        run: |
+          python -m eval.check_regression \
+            --baseline eval/baselines/main.json \
+            --current eval-run.json
+
+      - name: assert no fault leaked
+        # M29. A leaked fault does not announce itself -- it silently becomes
+        # the next run's baseline. Cheap to check, expensive to debug.
+        if: always()
+        run: |
+          for url in http://localhost:3001 http://localhost:8000 \
+                     http://localhost:8001 http://localhost:8080; do
+            state=$(curl -s --max-time 5 "$url/_internal/fault" || echo '{}')
+            echo "$url -> $state"
+            echo "$state" | grep -q '"active": *true' && {
+              echo "::error::fault leaked at $url"; exit 1; }
+          done
+          echo "all control planes clear"
+
+      - name: artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-${{ env.TIER }}-${{ github.sha }}
+          path: |
+            eval-run.json
+            eval-report.md
+          retention-days: 30
+
+      - name: logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.eval.yml \
+            --profile eval logs --tail=200 anomaly-detector trace-assembler
+
+      - name: tear down
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.eval.yml \
+            --profile eval down -v
+
+  # ------------------------------------------------------------------------
+  # The nightly run on main records the new baseline, so drift is visible as a
+  # trend rather than only as a pass/fail. It does NOT auto-commit: a baseline
+  # that updates itself can only ever ratchet in whichever direction the
+  # detector happens to be drifting, and a gate that moves with the thing it
+  # gates is not a gate.
+  # ------------------------------------------------------------------------
+  drift-report:
+    name: drift report
+    needs: eval
+    if: github.event_name == 'schedule' && always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: eval-full-${{ github.sha }}
+      - name: summarise
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          run = json.loads(pathlib.Path("eval-run.json").read_text())
+          base = json.loads(
+              pathlib.Path(f"eval/baselines/main-{run['tier']}.json").read_text())
+          s, b = run["scores"], base["scores"]
+          lines = ["## nightly detector drift", "",
+                   "| metric | tonight | baseline | delta |", "|---|---|---|---|"]
+          for k in ("f1", "precision", "recall", "mttd_p95_s"):
+              cur, old = s.get(k), b.get(k)
+              if cur is None or old is None:
+                  continue
+              lines.append(f"| {k} | {cur:.3f} | {old:.3f} | {cur - old:+.3f} |")
+          failed = [c for c in run["cases"] if c["outcome"] != "true_positive"]
+          if failed:
+              lines += ["", "### cases not clean", ""]
+              lines += [f"- `{c['case_name']}` {c['outcome']} - {c['detail']}"
+                        for c in failed]
+          pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
+              "\n".join(lines), encoding="utf-8")
+          PY

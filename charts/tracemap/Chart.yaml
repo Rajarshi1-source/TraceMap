@@ -1,0 +1,15 @@
+apiVersion: v2
+name: tracemap
+description: >
+  Critical-path dependency mapping and anomaly detection for distributed traces.
+  Deploys the five traced services, the OTel collector, Jaeger v2, and the
+  platform workers that build the graph and watch it.
+type: application
+# Chart version tracks the chart; appVersion tracks the code. They move
+# independently, and conflating them makes "which chart deployed which commit"
+# unanswerable at exactly the moment you need it.
+version: 0.7.0
+appVersion: "0.7.0"
+kubeVersion: ">=1.34.0-0"
+keywords: [observability, tracing, opentelemetry, jaeger, sre]
+home: https://github.com/Rajarshi1-source/TraceMap

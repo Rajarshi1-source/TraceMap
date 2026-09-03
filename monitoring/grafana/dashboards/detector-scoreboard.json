@@ -1,0 +1,173 @@
+{
+  "uid": "tracemap-detector",
+  "title": "TraceMap - Detector scoreboard",
+  "description": "The detector treated as a model: offline accuracy from the nightly golden set, online behaviour from what it actually emits. The two together are the claim; either alone is a half-claim. Precision from the eval set is measured against injected faults with known answers; alert volume is the proxy on-call actually feels between runs.",
+  "tags": ["tracemap", "mlops", "detector"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Offline accuracy - the nightly golden set",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "F1",
+      "description": "Gate floor is 0.82. Below it a merge is blocked, and the fix is the detector, not the tolerance.",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3,
+          "min": 0, "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.82 },
+              { "color": "green", "value": 0.85 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "tracemap_eval_f1", "legendFormat": "f1" }]
+    },
+    {
+      "type": "stat",
+      "title": "Precision",
+      "description": "The number that decides whether anyone still reads the alerts in month two. Alert fatigue is a human availability problem.",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 3, "min": 0, "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.87 },
+              { "color": "green", "value": 0.9 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "tracemap_eval_precision", "legendFormat": "precision" }]
+    },
+    {
+      "type": "stat",
+      "title": "Recall",
+      "description": "Reported, deliberately NOT gated. Recall alone is maximised by alerting on everything, and gating it would invite exactly that trade.",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "fieldConfig": { "defaults": { "decimals": 3, "min": 0, "max": 1 } },
+      "targets": [{ "expr": "tracemap_eval_recall", "legendFormat": "recall" }]
+    },
+    {
+      "type": "stat",
+      "title": "MTTD p95",
+      "description": "Measured by injecting known faults, not estimated. Ceiling is 432s, which is the pipeline's own worst case - the detector cannot be faster than the data reaching it. Computed over DETECTED cases only; the two null cases contribute no latency.",
+      "gridPos": { "h": 5, "w": 5, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s", "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 360 },
+              { "color": "red", "value": 432 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "tracemap_eval_mttd_p95_seconds", "legendFormat": "p95" }]
+    },
+    {
+      "type": "stat",
+      "title": "Hours since last eval",
+      "description": "A quality gate that stopped running is a quality gate that passes everything.",
+      "gridPos": { "h": 5, "w": 5, "x": 17, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h", "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 30 },
+              { "color": "red", "value": 36 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "(time() - tracemap_eval_last_run_timestamp_seconds) / 3600",
+        "legendFormat": "age"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Score drift",
+      "description": "The reason eval_runs is keyed by git SHA and stores detector_cfg as JSONB: any move in this line is attributable to a config change or it is drift, and without the config recorded alongside the score there is no way to tell which.",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        }
+      },
+      "targets": [
+        { "expr": "tracemap_eval_f1", "legendFormat": "f1" },
+        { "expr": "tracemap_eval_precision", "legendFormat": "precision" },
+        { "expr": "tracemap_eval_recall", "legendFormat": "recall" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Detection latency",
+      "description": "p50 and p95 across the golden set. A rise here with flat accuracy means the pipeline slowed, not the detector - check assembler lag before touching a threshold.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "tracemap_eval_mttd_p50_seconds", "legendFormat": "p50" },
+        { "expr": "tracemap_eval_mttd_p95_seconds", "legendFormat": "p95" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Online behaviour - between eval runs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Alerts per hour",
+      "description": "Precision's online proxy. Sustained volume above ~12/h is a broken detector rather than a broken application - check the nightly eval before tuning anything, because tuning without re-running the golden set is M8.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "targets": [{
+        "expr": "job:anomaly_alerts:rate1h",
+        "legendFormat": "alerts/h"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Detector heartbeat",
+      "description": "tracemap_worker_cycle_total. The VALUE is uninteresting; its ABSENCE is the alert. A worker that stops without crashing keeps every other surface looking healthy.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "targets": [{
+        "expr": "rate(tracemap_worker_cycle_total{worker=\"anomaly_detector\"}[5m]) * 60",
+        "legendFormat": "cycles/min"
+      }]
+    },
+    {
+      "type": "table",
+      "title": "Baselines per edge",
+      "description": "The EWMA baselines the detector compares against, on critical-path p99. A baseline that has climbed to sit on top of a known-degraded edge is the boiling-frog failure M6 exists to prevent - and it is visible here before it is visible anywhere else.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "targets": [{
+        "expr": "tracemap_edge_baseline_ms",
+        "format": "table",
+        "instant": true
+      }]
+    }
+  ]
+}

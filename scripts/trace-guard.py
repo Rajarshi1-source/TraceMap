@@ -76,7 +76,7 @@ def main() -> int:
             )
             try:
                 urllib.request.urlopen(req, timeout=15).read()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - a guard reports a failure, it does not crash on one
                 print(f"  could not reach the gateway at {args.gateway}: {exc}")
                 return 1
         # collector batch (5s) + tail sampling decision_wait (10s) + export.
@@ -152,7 +152,7 @@ def main() -> int:
     tagged = set(versions)
     check(
         "every service carries service.version (M24)",
-        ALL_SERVICES <= tagged,
+        tagged >= ALL_SERVICES,
         ", ".join(f"{k}={v}" for k, v in sorted(versions.items()))
         or "no service.version tags found",
     )

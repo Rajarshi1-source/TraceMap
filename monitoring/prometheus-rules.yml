@@ -89,3 +89,143 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "Burning the 30-day error budget 14.4x - 2% consumed in 1h"
+
+  # ------------------------------------------------------------------------
+  # Phase 7: the pipeline's own SLIs.
+  #
+  # Everything above watches the traced application, or watches the workers
+  # for signs of death. This group watches for the failure that is worse than
+  # death: a pipeline that is up, answering, and quietly losing data. Dropped
+  # spans leave no trace -- that is what makes them dangerous, and it is why
+  # these are ratios against a denominator rather than thresholds on a count.
+  # ------------------------------------------------------------------------
+  - name: tracemap-pipeline
+    rules:
+      - record: job:span_ingest_completeness:5m
+        expr: >
+          sum(rate(otelcol_exporter_sent_spans_total[5m]))
+            / clamp_min(sum(rate(otelcol_receiver_accepted_spans_total[5m])), 1)
+
+      - alert: SpanIngestionLoss
+        # SLI target is >= 99.9% stored. Below 99% something is systematically
+        # wrong rather than momentarily slow, and every percentile computed
+        # downstream is being computed over a biased sample.
+        expr: job:span_ingest_completeness:5m < 0.99
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Losing more than 1% of spans in the pipeline"
+          description: >
+            Dropped spans are silent blind spots. Nothing errors, the
+            dashboards render, and the traces that survive look normal --
+            which is precisely why this needs a page rather than a graph
+            somebody might look at.
+
+      - alert: ExporterQueueBackingUp
+        # M15: the persistent sending queue is what survives a storage blip.
+        # A queue that is filling means the blip is outlasting the buffer, and
+        # the spans about to be dropped are the ones from the incident.
+        expr: >
+          otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1)
+            > 0.8
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Collector export queue over 80% full"
+
+      - alert: TailSamplingDroppingEverything
+        # A tail_sampling policy edit that accidentally matches nothing looks
+        # identical to healthy operation from every dashboard except this one.
+        expr: >
+          sum(rate(otelcol_processor_tail_sampling_sampling_trace_dropped_too_early[10m])) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Traces reaching the sampler after their decision window"
+          description: >
+            decision_wait is shorter than the trace's own duration, so the
+            sampler is deciding on incomplete traces. Every downstream
+            percentile is then computed over whichever spans happened to
+            arrive first.
+
+      - alert: GraphStaleness
+        # The consistency budget, made alertable. The dashboard shows a
+        # staleness banner (M26) when it knows; this catches the case where
+        # the API is happily serving a cached graph nobody has refreshed.
+        expr: time() - tracemap_graph_built_timestamp_seconds > 120
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Dependency map older than two minutes"
+          description: >
+            Target is 95% of renders under 60s stale. Silently stale numbers
+            are worse than no numbers, because they are acted on.
+
+  # ------------------------------------------------------------------------
+  # The detector, watched as a model rather than as a service.
+  #
+  # The eval harness measures accuracy offline, on a golden set, nightly. That
+  # leaves a gap: between two nightly runs the detector can drift, and the
+  # only online signal available is the shape of what it emits. Alert volume
+  # is a proxy for precision, and it is the proxy on-call actually feels.
+  # ------------------------------------------------------------------------
+  - name: tracemap-detector
+    rules:
+      - record: job:anomaly_alerts:rate1h
+        expr: sum(rate(tracemap_anomalies_emitted_total[1h])) * 3600
+
+      - alert: AlertVolumeSpike
+        # Twelve alerts an hour is not an incident, it is a broken detector.
+        # Alert fatigue is a human availability problem: a channel nobody
+        # reads is indistinguishable from no alerting, except that it costs
+        # money and creates the belief that someone is watching.
+        expr: job:anomaly_alerts:rate1h > 12
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "More than 12 anomalies per hour - suspect precision, not the app"
+          description: >
+            Check the nightly eval before tuning anything. Changing alpha or
+            the threshold without re-running the golden set is M8, and the
+            MLOps claim rests entirely on tuning decisions having a number
+            behind them.
+
+      - alert: DetectorSilentTooLong
+        # The opposite failure, and the harder one to notice. A detector that
+        # has not fired in 24 hours is either watching a very healthy system
+        # or has stopped working in a way the heartbeat cannot see -- a
+        # baseline that chased a fault (M6) still cycles happily.
+        expr: >
+          job:anomaly_alerts:rate1h == 0
+          and on() (time() - tracemap_last_anomaly_timestamp_seconds) > 86400
+        for: 1h
+        labels: { severity: ticket }
+        annotations:
+          summary: "No anomaly in 24h - confirm the detector still can fire"
+          description: >
+            Silence is the expected state and also the symptom of a blinded
+            baseline. The nightly eval is what distinguishes them; if it has
+            not run, that is the actual finding.
+
+      - alert: EvalGateRegressed
+        # Exported by the nightly run. Drift between releases is the thing the
+        # regression gate cannot catch, because nothing was merged.
+        expr: tracemap_eval_f1 < 0.82
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Nightly detector F1 below the gate floor"
+          description: >
+            F1 {{ $value | printf "%.3f" }} against a 0.82 floor. Fix the
+            detector or move the baseline in a commit that explains why --
+            never by loosening the tolerance.
+
+      - alert: EvalNotRunning
+        # A quality gate that stopped running is a quality gate that passes
+        # everything. This is the same class of failure as the detector
+        # heartbeat, one level up.
+        expr: absent_over_time(tracemap_eval_f1[36h])
+        for: 1h
+        labels: { severity: ticket }
+        annotations:
+          summary: "No eval run in 36 hours - the gate is not gating"

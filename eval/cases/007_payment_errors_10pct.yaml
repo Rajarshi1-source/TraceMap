@@ -1,0 +1,25 @@
+name: payment_errors_10pct
+family: error
+description: >
+  One request in ten to payment-svc /charge answers 502. Latency barely moves --
+  a fast failure is fast -- so this case is unreachable for a detector that
+  only watches percentiles. It is here because half a detector passes the other
+  eleven cases.
+
+  10% is the awkward magnitude on purpose: high enough to matter to customers,
+  low enough that an error-rate rule with a lazy threshold sleeps through it.
+injector:
+  type: error
+  target: payment-svc
+  endpoint: /charge
+  error_rate: 0.10
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

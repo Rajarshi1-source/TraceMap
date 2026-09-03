@@ -1,0 +1,42 @@
+name: user_cpu_saturation
+family: saturation
+description: >
+  250ms of CPU burn on user-svc /users. Nothing is "slow" in the sense of
+  waiting -- the service is busy, which is a different failure with the same
+  symptom, and it is the one an injected sleep cannot model. `cpu_burn_ms`
+  busy-waits and occupies the event loop the way real pressure does.
+
+  user-svc is the cheapest fan-out leg and normally carries zero blame -- its
+  measured critical p99 is exactly 0.0 over ~11,000 traces. At ~280ms it
+  overtakes payment (critical p99 157ms) and becomes the critical path.
+
+  This is the exact inverse of case 006 and the pair is the point. 006 makes
+  user-svc slow but not slowest and requires SILENCE; this makes it slowest and
+  requires an ALERT. A detector hard-wired to blame payment passes 006 for
+  entirely the wrong reason and fails here.
+
+  250ms of burn rather than 150. At 150 the margin over payment is ~23ms
+  against bucket-to-bucket p99 noise of roughly +/-20ms, which is a case that
+  fails intermittently -- and an intermittent case gets deleted rather than
+  debugged.
+
+  EDGE CORRECTION: the reference harness names this edge `gateway-svc->user-svc`.
+  No such edge exists. The fan-out lives in order-svc, so user-svc is a child of
+  order-svc and gateway-svc never calls it. Documented in ADR 0006.
+injector:
+  type: saturation
+  target: user-svc
+  endpoint: /users
+  cpu_burn_ms: 250
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->user-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->product-svc"
+    # Payment is untouched and is displaced from the critical path by a
+    # saturated user-svc, so its critical p99 falls rather than rises.
+    - "order-svc->payment-svc"

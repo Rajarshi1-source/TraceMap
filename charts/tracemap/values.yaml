@@ -1,0 +1,251 @@
+# TraceMap chart values.
+#
+# Sizing is not guesswork. The requests below come from measured component
+# floors totalling roughly 7 GB (docs/SCALING.md); a 4 GB node OOM-kills
+# ClickHouse first and then everything that depends on it, which presents as a
+# tracing outage rather than as a memory problem. Target is a 4 vCPU / 8 GB
+# node -- Hetzner CX32 or an Oracle Always-Free ARM instance.
+
+global:
+  # M24. Every span carries service.version, so the deploy watcher can
+  # correlate an anomaly to a release. Set by the deploy pipeline; the default
+  # is deliberately not "latest", because "latest" cannot be correlated to
+  # anything.
+  gitSha: "dev-local"
+  imageRegistry: ghcr.io
+  imageRepository: rajarshi1-source/tracemap
+  imagePullPolicy: IfNotPresent
+  environment: production
+
+# ---------------------------------------------------------------- probes
+#
+# M17, and it is the mistake most worth not making.
+#
+#   /healthz  "should I be restarted?"   process only, NEVER a dependency
+#   /readyz   "should I get traffic?"    dependencies belong here
+#
+# Check a database in a liveness probe and one slow query fails liveness on
+# every replica simultaneously. Kubernetes restarts the fleet, the restarts
+# add load to the already-slow database, and a degradation becomes an outage
+# that looks self-inflicted because it is.
+#
+# The startup probe exists so a slow boot is not mistaken for a hang: with
+# failureThreshold 20 at 3s, a pod gets 60 seconds to come up before liveness
+# starts counting against it.
+probes:
+  startup:
+    path: /healthz
+    periodSeconds: 3
+    failureThreshold: 20
+  liveness:
+    path: /healthz
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+
+# --------------------------------------------------------------- security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -------------------------------------------------------------- services
+#
+# `port` is the container port. `fanout: true` marks the three services
+# order-svc calls concurrently -- they are the edges the critical-path
+# attribution is about, and the ones the eval harness injects into.
+services:
+  gateway-svc:
+    image: gateway
+    port: 3000
+    replicas: 2
+    public: true
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits:   { cpu: 300m, memory: 256Mi }
+  order-svc:
+    image: order
+    port: 3001
+    replicas: 2
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 320Mi }
+  user-svc:
+    image: user
+    port: 8000
+    replicas: 2
+    fanout: true
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits:   { cpu: 300m, memory: 256Mi }
+  payment-svc:
+    image: payment
+    port: 8001
+    replicas: 2
+    fanout: true
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits:   { cpu: 300m, memory: 256Mi }
+  product-svc:
+    image: product
+    port: 8080
+    replicas: 2
+    fanout: true
+    # Distroless, ~12MB. It can afford a tighter limit than the Node services
+    # because there is no runtime to warm up.
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits:   { cpu: 300m, memory: 192Mi }
+
+# The analytics API is the only component with an HPA. It is the one whose load
+# scales with viewers rather than with traffic, and the only one where adding a
+# replica helps -- the workers are singletons by design, and scaling the
+# detector would multiply alerts rather than throughput.
+analyticsApi:
+  enabled: true
+  image: platform
+  port: 8090
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# --------------------------------------------------------------- workers
+#
+# Every worker is a single replica ON PURPOSE.
+#
+# The assembler stitching the same trace twice writes duplicate edges and
+# corrupts every percentile downstream (F2). The detector running twice would
+# double every alert -- Redis dedup catches that, but relying on dedup for
+# correctness rather than for tidiness is the wrong reason to have it. The
+# graph builder holds a Redis lock, so a second replica is idle by design and
+# costs memory for nothing.
+#
+# "Why is this not horizontally scalable" is a fair question with a real
+# answer: sharding by trace ID would work and is not worth the complexity at
+# this volume. That is a decision, not an omission.
+workers:
+  traceAssembler:
+    enabled: true
+    resources:
+      requests: { cpu: 150m, memory: 256Mi }
+      limits:   { cpu: 800m, memory: 768Mi }
+  graphBuilder:
+    enabled: true
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 300m, memory: 256Mi }
+  anomalyDetector:
+    enabled: true
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits:   { cpu: 300m, memory: 256Mi }
+    config:
+      # The model artifact. Changing any of these without re-running the eval
+      # set is M8 -- the MLOps claim rests on every tuning decision having a
+      # number behind it rather than an argument.
+      alpha: "0.2"
+      thresholdMs: "50"
+      minRequests: "100"
+      sustainedCycles: "3"
+      # Fixed rather than learned: zero is the target for errors in a way it
+      # never is for latency.
+      errorRateThreshold: "0.02"
+      warmupCycles: "5"
+      intervalS: "60"
+    # M20. The dangerous feature ships OFF, behind a confidence floor, a rate
+    # limit, a kill switch and an audit trail. Remediating automatically on a
+    # correlation signal is how one bad deploy becomes a rollback loop.
+    autoRollback:
+      enabled: false
+      confidenceFloor: "0.9"
+      maxPerServicePerHour: 1
+  deployWatcher:
+    enabled: true
+    resources:
+      requests: { cpu: 50m, memory: 96Mi }
+      limits:   { cpu: 200m, memory: 192Mi }
+
+dashboard:
+  enabled: true
+  image: dashboard
+  port: 3002
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 300m, memory: 384Mi }
+
+# --------------------------------------------------- disruption budgets
+#
+# minAvailable: 1 rather than a percentage. At two replicas a 50% budget
+# rounds to one, and at one replica it rounds to zero -- which silently
+# permits a drain to take the last pod down. An absolute floor says what it
+# means at every replica count.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ------------------------------------------------------------- ingress
+ingress:
+  enabled: true
+  className: traefik
+  host: tracemap.example.com
+  tls:
+    enabled: true
+    secretName: tracemap-tls
+    clusterIssuer: letsencrypt-prod
+  # An unauthenticated write API on the public internet, linked from a CV, is
+  # a liability rather than a demonstration. Read paths are public so the
+  # dependency map can be shown; everything that mutates state sits behind
+  # basic auth at the ingress.
+  auth:
+    enabled: true
+    secretName: tracemap-basic-auth
+    protectedPaths:
+      - /_internal
+      - /api/rollback
+      - /api/rules
+
+networkPolicy:
+  enabled: true
+
+serviceMonitor:
+  enabled: false   # requires the Prometheus operator CRDs
+
+datastores:
+  # Chart-managed StatefulSets are out of scope: a database in the same chart
+  # as its consumers gets deleted with them. These point at whatever runs them.
+  clickhouse:
+    host: clickhouse
+    port: 8123
+    database: tracemap
+    existingSecret: tracemap-clickhouse
+  postgres:
+    host: postgres
+    port: 5432
+    database: tracemap
+    existingSecret: tracemap-postgres
+  redis:
+    url: redis://redis:6379/0
+
+otel:
+  collectorEndpoint: http://otel-collector:4317

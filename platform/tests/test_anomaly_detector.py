@@ -327,3 +327,99 @@ async def test_a_60ms_fault_is_detectable_after_a_noisy_warmup():
 
     assert fired is not None, "a 60ms fault on a 110ms edge failed to alert"
     assert fired.delta_ms > 50
+
+
+# ===========================================================================
+# The error path, added in Phase 7 because the eval harness found it missing
+# ===========================================================================
+#
+# An injected 5xx returns FASTER than a success -- payment-svc raises before
+# the database write -- so critical-path p99 does not move. A detector reading
+# only latency is blind to an edge failing half its requests, and eval cases
+# 007 and 008 scored as false negatives against a detector that was working
+# exactly as designed on the metric it had.
+def err_obs(rate: float, *, requests: int = 500, crit: float = 100.0):
+    return EdgeObservation(
+        source="a", target="b",
+        critical_p99_ms=crit,
+        wall_p99_ms=crit,
+        request_count=requests,
+        error_rate=rate,
+    )
+
+
+@pytest.mark.asyncio
+async def test_error_rate_alerts_after_the_sustained_window():
+    d = AnomalyDetector(FakeRedis())
+
+    assert await d.evaluate_error_rate(err_obs(0.10)) is None, "one cycle is weather"
+    assert await d.evaluate_error_rate(err_obs(0.10)) is None, "two is still weather"
+    fired = await d.evaluate_error_rate(err_obs(0.10))
+
+    assert fired is not None, "10% errors sustained for three cycles must alert"
+    assert fired.metric == "error_rate"
+    assert fired.observed_ms == pytest.approx(0.10)
+
+
+@pytest.mark.asyncio
+async def test_error_rate_is_invisible_to_the_latency_gate():
+    """The reason this path exists at all.
+
+    Identical latency, half the requests failing. The latency gate is right to
+    stay silent -- nothing got slower -- and that is precisely why it cannot be
+    the only gate.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(10):
+        await d.evaluate(err_obs(0.0, crit=100.0))
+
+    latency_fired = None
+    error_fired = None
+    for _ in range(5):
+        latency_fired = await d.evaluate(err_obs(0.50, crit=100.0)) or latency_fired
+        error_fired = await d.evaluate_error_rate(err_obs(0.50, crit=100.0)) or error_fired
+
+    assert latency_fired is None, "latency did not change; the latency gate is correct to be quiet"
+    assert error_fired is not None, "50% of requests failing must reach someone"
+
+
+@pytest.mark.asyncio
+async def test_healthy_error_rate_never_alerts():
+    """The null-case equivalent for the error path.
+
+    A measured healthy floor of ~0.08% sits far below the 2% threshold. If this
+    ever fires, the threshold is wrong, not the traffic.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(20):
+        assert await d.evaluate_error_rate(err_obs(0.0008)) is None
+
+
+@pytest.mark.asyncio
+async def test_error_rate_respects_the_request_floor():
+    """An error rate over four requests is one bad request wearing a percentage."""
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(5):
+        assert await d.evaluate_error_rate(err_obs(1.0, requests=4)) is None
+
+
+@pytest.mark.asyncio
+async def test_error_and_latency_alerts_do_not_suppress_each_other():
+    """Separate dedup keys, and the reason is a real failure mode.
+
+    An edge that is both slow and failing is two incidents. Sharing a dedup key
+    would mean whichever fired first silences the other for ten minutes, and
+    the one that gets silenced is whichever the responder most needed.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(10):
+        await d.evaluate(err_obs(0.0, crit=100.0))
+
+    latency_fired = None
+    error_fired = None
+    for _ in range(5):
+        latency_fired = await d.evaluate(err_obs(0.30, crit=300.0)) or latency_fired
+        error_fired = await d.evaluate_error_rate(err_obs(0.30, crit=300.0)) or error_fired
+
+    assert latency_fired is not None and error_fired is not None
+    assert {latency_fired.metric, error_fired.metric} == {"critical_p99", "error_rate"}

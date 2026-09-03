@@ -392,6 +392,7 @@ services:
       DETECTOR_THRESHOLD_MS: ${DETECTOR_THRESHOLD_MS:-50}
       DETECTOR_MIN_REQUESTS: ${DETECTOR_MIN_REQUESTS:-100}
       DETECTOR_SUSTAINED_CYCLES: ${DETECTOR_SUSTAINED_CYCLES:-3}
+      DETECTOR_ERROR_RATE_THRESHOLD: ${DETECTOR_ERROR_RATE_THRESHOLD:-0.02}
       DETECTOR_WARMUP_CYCLES: ${DETECTOR_WARMUP_CYCLES:-5}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
       JAEGER_BASE: ${JAEGER_BASE:-http://localhost:16686}
@@ -448,8 +449,66 @@ services:
     restart: unless-stopped
     profiles: [core, full, eval]
 
+  # ---------------------------------------------------------------- monitoring
+  #
+  # `full` profile only. D2 keeps Prometheus and Grafana OUT of `core` so the
+  # 8 GB target host has headroom against the ~7 GB measured floor -- adding a
+  # gigabyte of monitoring to a box already at its limit turns a demo into an
+  # OOM kill, and the thing that dies first is ClickHouse.
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus-rules.yml:/etc/prometheus/rules/tracemap.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+    profiles: [full]
+
+  grafana:
+    image: grafana/grafana:13.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-change-me-locally}
+      # Anonymous viewing is convenient for a local demo and is exactly the
+      # setting that must not survive to a public host. It is scoped to Viewer
+      # so a link cannot edit a dashboard, and the Helm chart does not set it.
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANON:-true}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3003:3000"
+    depends_on:
+      prometheus: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    profiles: [full]
+
 volumes:
   pgdata:
   chdata:
   jaegerdata:
   otelqueue:
+  promdata:
+  grafanadata:

@@ -1,0 +1,139 @@
+{{/*
+The five traced services: one Deployment, one Service and one PDB each.
+
+Generated from a loop rather than written five times. Five near-identical
+manifests drift -- one of them ends up with a dependency check in its liveness
+probe, or without the git-sha label, and nothing fails until an incident.
+*/}}
+{{- range $name, $svc := .Values.services }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tracemap.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $svc.replicas }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable 0 means capacity never dips during a rollout -- which is
+      # only actually true if the readiness probe is honest. A readiness probe
+      # that returns 200 before the process can serve makes this setting a
+      # comforting lie.
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "tracemap.podLabels" (dict "root" $ "name" $name) | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      # Spread replicas across nodes where there is more than one. On a
+      # single-node k3s this is a no-op by design rather than by accident:
+      # ScheduleAnyway means the pod still schedules instead of pending
+      # forever while someone works out why.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: {{ $name }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "tracemap.image" (dict "root" $ "image" $svc.image) }}
+          imagePullPolicy: {{ $.Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "tracemap.otelEnv" (dict "root" $ "name" $name) | nindent 12 }}
+            {{- include "tracemap.datastoreEnv" $ | nindent 12 }}
+            - name: PORT
+              value: {{ $svc.port | quote }}
+            {{- if eq $name "gateway-svc" }}
+            - name: ORDER_URL
+              value: http://order-svc:3001
+            - name: PRODUCT_URL
+              value: http://product-svc:8080
+            {{- else if eq $name "order-svc" }}
+            - name: USER_URL
+              value: http://user-svc:8000
+            - name: PRODUCT_URL
+              value: http://product-svc:8080
+            - name: PAYMENT_URL
+              value: http://payment-svc:8001
+            {{- end }}
+            # M23. Every fault flag defaults to zero. A fault must never be on
+            # by accident, and shipping a chart whose default is anything but
+            # off is exactly that accident waiting for a copy-paste.
+            - name: TRACEMAP_FAULT_DELAY_MS
+              value: "0"
+            - name: TRACEMAP_FAULT_ERROR_RATE
+              value: "0"
+            - name: TRACEMAP_FAULT_CPU_BURN_MS
+              value: "0"
+            - name: TRACEMAP_FAULT_TTL_S
+              value: "600"
+          {{- include "tracemap.probes" (dict "root" $ "port" $svc.port) | nindent 10 }}
+          resources:
+            # Requests drive scheduling; limits only cap. Omitting requests is
+            # how a node ends up overcommitted and everything gets slow at once
+            # with no single pod obviously at fault.
+            {{- toYaml $svc.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "tracemap.tmpMount" $ | nindent 12 }}
+      volumes:
+        {{- include "tracemap.tmpVolume" $ | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tracemap.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: {{ include "tracemap.name" $ }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $name }}
+{{- if $.Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tracemap.labels" $ | nindent 4 }}
+spec:
+  # An absolute floor, not a percentage: at two replicas a 50% budget rounds to
+  # one and at one replica it rounds to zero, which quietly permits a node
+  # drain to take the last pod with it.
+  minAvailable: {{ $.Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $name }}
+{{- end }}
+{{- end }}

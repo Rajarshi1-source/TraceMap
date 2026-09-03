@@ -1,0 +1,330 @@
+{{/*
+The analytics API, the dashboard, and the four workers.
+
+The split that matters here is between the API, which scales horizontally and
+has an HPA, and the workers, which are singletons. Both facts are deliberate
+and both have a reason worth saying out loud -- see values.yaml.
+*/}}
+{{- $api := .Values.analyticsApi }}
+{{- if $api.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-api
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+    app.kubernetes.io/component: analytics-api
+spec:
+  {{- if not $api.autoscaling.enabled }}
+  replicas: {{ $api.replicas }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: analytics-api
+  template:
+    metadata:
+      labels:
+        {{- include "tracemap.podLabels" (dict "root" $ "name" "analytics-api") | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: analytics-api
+          image: {{ include "tracemap.image" (dict "root" $ "image" $api.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "{{ $api.port }}"]
+          ports:
+            - name: http
+              containerPort: {{ $api.port }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "tracemap.clickhouseEnv" . | nindent 12 }}
+            {{- include "tracemap.datastoreEnv" . | nindent 12 }}
+            - name: GIT_SHA
+              value: {{ .Values.global.gitSha | quote }}
+            - name: CORS_ORIGINS
+              value: "https://{{ .Values.ingress.host }}"
+          {{- include "tracemap.probes" (dict "root" $ "port" $api.port) | nindent 10 }}
+          resources:
+            {{- toYaml $api.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "tracemap.tmpMount" . | nindent 12 }}
+      volumes:
+        {{- include "tracemap.tmpVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-api
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $api.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: {{ include "tracemap.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: analytics-api
+{{- if $api.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: analytics-api
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: analytics-api
+  minReplicas: {{ $api.autoscaling.minReplicas }}
+  maxReplicas: {{ $api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $api.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      # Five minutes of stabilisation before scaling in. The API's load is
+      # bursty -- a dashboard refresh spikes it -- and scaling down into the
+      # next burst produces a sawtooth that looks like an incident.
+      stabilizationWindowSeconds: 300
+{{- end }}
+{{- if .Values.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: analytics-api
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: analytics-api
+{{- end }}
+{{- end }}
+
+{{- if .Values.dashboard.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dashboard
+spec:
+  replicas: {{ .Values.dashboard.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        {{- include "tracemap.podLabels" (dict "root" $ "name" "dashboard") | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dashboard
+          image: {{ include "tracemap.image" (dict "root" $ "image" .Values.dashboard.image) }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.dashboard.port }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            # F16: Next.js standalone binds to $HOSTNAME, which Kubernetes sets
+            # to the pod name. Left alone the server binds to a name that does
+            # not resolve to an interface and the pod never becomes ready.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: ANALYTICS_API_URL
+              value: http://analytics-api:{{ $api.port }}
+            - name: NEXT_PUBLIC_API_BASE
+              value: "https://{{ .Values.ingress.host }}"
+          startupProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.dashboard.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "tracemap.tmpMount" . | nindent 12 }}
+            - name: next-cache
+              mountPath: /app/.next/cache
+      volumes:
+        {{- include "tracemap.tmpVolume" . | nindent 8 }}
+        - name: next-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.dashboard.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: {{ include "tracemap.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: dashboard
+{{- end }}
+
+{{/* ---------------------------------------------------------- workers ---
+
+Recreate, not RollingUpdate.
+
+A rolling update of a singleton worker briefly runs two of them, which is the
+one thing these must never do. Two assemblers stitch the same trace twice and
+write duplicate edges, which corrupts every percentile downstream and is
+invisible until a number looks wrong (F2). Ten seconds of gap during a deploy
+is cheaper than a corrupted roll-up.
+*/}}
+{{- range $key, $w := .Values.workers }}
+{{- if $w.enabled }}
+{{- $names := dict "traceAssembler" "trace-assembler" "graphBuilder" "graph-builder" "anomalyDetector" "anomaly-detector" "deployWatcher" "deploy-watcher" }}
+{{- $modules := dict "traceAssembler" "trace_assembler_worker" "graphBuilder" "graph_builder_worker" "anomalyDetector" "anomaly_detector_worker" "deployWatcher" "deploy_watcher_worker" }}
+{{- $name := get $names $key }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tracemap.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tracemap.name" $ }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      labels:
+        {{- include "tracemap.podLabels" (dict "root" $ "name" $name) | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+    spec:
+      {{- if eq $key "deployWatcher" }}
+      serviceAccountName: {{ include "tracemap.fullname" $ }}-deploy-watcher
+      {{- end }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "tracemap.image" (dict "root" $ "image" "platform") }}
+          command: ["python", "-m", "workers.{{ get $modules $key }}"]
+          ports:
+            - name: metrics
+              containerPort: 9100
+            {{- if eq $key "deployWatcher" }}
+            # The deploy control plane. Cluster-internal only -- the
+            # NetworkPolicy and the ingress auth rules both keep it off the
+            # public path, because POSTing a deploy marker rewrites the
+            # correlation history every future alert is built on.
+            - name: control
+              containerPort: 9103
+            {{- end }}
+          securityContext:
+            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+          env:
+            {{- include "tracemap.clickhouseEnv" $ | nindent 12 }}
+            {{- include "tracemap.datastoreEnv" $ | nindent 12 }}
+            - name: METRICS_PORT
+              value: "9100"
+            - name: GIT_SHA
+              value: {{ $.Values.global.gitSha | quote }}
+            {{- if eq $key "anomalyDetector" }}
+            # Written out rather than derived from the values keys. A
+            # camelCase-to-SCREAMING_SNAKE helper reads as elegant and gets
+            # one of these wrong -- the interval is DETECT_INTERVAL_S, not
+            # DETECTOR_INTERVAL_S, and a detector silently falling back to its
+            # 60s default is exactly the kind of thing that never surfaces.
+            - name: DETECTOR_ALPHA
+              value: {{ $w.config.alpha | quote }}
+            - name: DETECTOR_THRESHOLD_MS
+              value: {{ $w.config.thresholdMs | quote }}
+            - name: DETECTOR_MIN_REQUESTS
+              value: {{ $w.config.minRequests | quote }}
+            - name: DETECTOR_SUSTAINED_CYCLES
+              value: {{ $w.config.sustainedCycles | quote }}
+            - name: DETECTOR_ERROR_RATE_THRESHOLD
+              value: {{ $w.config.errorRateThreshold | quote }}
+            - name: DETECTOR_WARMUP_CYCLES
+              value: {{ $w.config.warmupCycles | quote }}
+            - name: DETECT_INTERVAL_S
+              value: {{ $w.config.intervalS | quote }}
+            - name: AUTO_ROLLBACK_ENABLED
+              value: {{ $w.autoRollback.enabled | quote }}
+            - name: AUTO_ROLLBACK_CONFIDENCE_FLOOR
+              value: {{ $w.autoRollback.confidenceFloor | quote }}
+            - name: AUTO_ROLLBACK_MAX_PER_SERVICE_PER_HOUR
+              value: {{ $w.autoRollback.maxPerServicePerHour | quote }}
+            {{- end }}
+            {{- if eq $key "deployWatcher" }}
+            - name: DEPLOY_CONTROL_PORT
+              value: "9103"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            {{- end }}
+          # Workers have no HTTP surface beyond /metrics, so liveness is
+          # "is the process serving its own metrics endpoint". That is a
+          # process check, which is what liveness is for -- and it is NOT a
+          # heartbeat check. A worker whose loop has stopped while the process
+          # lives still serves metrics and still passes this. The absence of
+          # tracemap_worker_cycle_total is what catches that, and it belongs
+          # in Prometheus rather than in a probe: a stalled detector must page
+          # a human, not be silently restarted into the same stall.
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 15
+            failureThreshold: 4
+          readinessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 10
+          resources:
+            {{- toYaml $w.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "tracemap.tmpMount" $ | nindent 12 }}
+      volumes:
+        {{- include "tracemap.tmpVolume" $ | nindent 8 }}
+{{- end }}
+{{- end }}

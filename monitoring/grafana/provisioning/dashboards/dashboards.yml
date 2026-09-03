@@ -1,0 +1,16 @@
+apiVersion: 1
+providers:
+  - name: tracemap
+    orgId: 1
+    folder: TraceMap
+    type: file
+    # Dashboards live in git and are provisioned read-only on purpose. A
+    # dashboard edited in the UI and never exported is a dashboard that
+    # disappears with the container, and the panel someone relied on during an
+    # incident is exactly the one nobody wrote down.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

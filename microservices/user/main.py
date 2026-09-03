@@ -79,3 +79,15 @@ async def set_fault(body: dict):
 async def clear_fault():
     fault_config.clear()
     return {"ok": True, **fault_config.describe()}
+
+
+@app.get("/_internal/fault")
+async def get_fault():
+    """Report the current fault state.
+
+    Every other service has this and user-svc did not, which made it the one
+    place a leaked fault could hide: the eval harness asks each control plane
+    "are you clean?" before the first case and after the last, and a 405 is
+    not an answer. M29 is enforced by that sweep, so a service that cannot be
+    asked is a service outside the guard."""
+    return fault_config.describe()

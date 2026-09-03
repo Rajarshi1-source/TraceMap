@@ -45,6 +45,8 @@ class FaultRequest(BaseModel):
     delay_ms: int = 0
     error_rate: float = 0.0
     cpu_burn_ms: int = 0
+    dep_down: bool = False
+    dep_timeout_ms: int = 250
     endpoint: str = ""
     ttl_s: int = 600
 
@@ -72,6 +74,14 @@ async def charge(body: ChargeRequest):
     if cfg.error_rate and random.random() < cfg.error_rate:
         raise HTTPException(status_code=502, detail="payment_provider_error")
 
+    # Dependency kill (eval case 010): this service's database is unreachable.
+    # Modelled as a hang-then-fail rather than an instant refusal, because an
+    # instant refusal is the easy case -- a dependency that hangs is the one
+    # that eats the connection pool and takes the caller down with it.
+    if cfg.dep_down:
+        await asyncio.sleep(cfg.dep_timeout_ms / 1000)
+        raise HTTPException(status_code=503, detail="payment_db_unreachable")
+
     charge_id = await db.insert_payment("captured")
     return {"id": charge_id, "status": "captured", "amount": body.amount}
 
@@ -98,6 +108,11 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     """Dependencies are checked HERE."""
+    # A killed dependency must fail readiness, not liveness (M17). Readiness
+    # takes the pod out of rotation; liveness would restart it, and restarting
+    # a pod because its database is slow turns a degradation into an outage.
+    if fault_config.for_endpoint("/charge").dep_down:
+        raise HTTPException(status_code=503, detail="db_unreachable")
     try:
         await db.ping()
     except Exception as exc:
@@ -111,7 +126,9 @@ async def readyz():
 @app.post("/_internal/fault")
 async def set_fault(body: FaultRequest):
     fault_config.set(
-        Fault(delay_ms=body.delay_ms, error_rate=body.error_rate, cpu_burn_ms=body.cpu_burn_ms),
+        Fault(delay_ms=body.delay_ms, error_rate=body.error_rate,
+              cpu_burn_ms=body.cpu_burn_ms, dep_down=body.dep_down,
+              dep_timeout_ms=body.dep_timeout_ms),
         body.endpoint,
         body.ttl_s,
     )

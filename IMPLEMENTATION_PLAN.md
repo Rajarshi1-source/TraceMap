@@ -27,7 +27,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
 | **5 — API + dashboard** | ✅ **Done** | 7/7 verified; toggle fades the parallel edge, positions drift 1.14px across polls |
 | **6 — Detector + deploy attribution** | ✅ **Done** | 7/7 verified live; 60ms fault alerted at **375s** — see F19 on the budget |
-| 7 — Eval harness + CI ⭐ | Not started | |
+| **7 — Eval harness + CI ⭐** | ⚠️ **Built, gate red** | Smoke tier measured: **precision 0.750 / recall 1.000 / F1 0.857, MTTD p50 242s p95 273s**. Null, latency and error cases pass; **decoy fails (F37, open)**. Criterion 4's MTTD ceiling amended (F28). **Criterion 8's live URL not deployed.** No baseline committed — this host cannot time reliably (F36) |
 | 8 — Docs + polish | Not started | |
 
 Phase 1 measured: **19.67 req/s, 0.08% error rate, p95 128ms**. Checkout p95 sits
@@ -698,6 +698,435 @@ nobody should trust.
 
 ---
 
+## 2h. Found while building (Phase 7)
+
+Fifteen findings. **Eleven in the harness, one in the detector, two in the environment it needs, and one still open** — which is the
+phase working as intended. An eval suite that has never failed is evidence of
+an untested harness, not of a working detector, and four of these were found by
+the harness scoring a correct detector as broken.
+
+Three deserve reading even if the rest are skipped. **F28** is a gate a correct
+detector could never pass. **F30** is a decoy that punished the detector for
+being right. **F29** is the one that would have been tuned away rather than
+understood. **F32** is the one that justifies the phase: a whole missing
+capability, found by asking the system to do something rather than by reading
+its code.
+
+### F23 — 🔴 The reference case 009 names an edge that cannot exist
+
+`eval-harness.md` specifies case 009's expected edge as
+`gateway-svc->user-svc`, and lists it as a trap in three other cases. There is
+no such edge. The concurrent fan-out lives in `order-svc`, so `user-svc` is a
+child of order-svc and gateway-svc has never called it:
+
+```
+gateway-svc ── order-svc ──┬── user-svc      30ms
+            └─ product-svc │   product-svc   45ms   (also a direct browse edge)
+                           └── payment-svc   90ms
+```
+
+The case would have run, injected a real 150ms CPU burn, watched for an alert
+on an edge that cannot produce one, and scored a working detector as a **false
+negative** — and the natural response to a red eval is to weaken the detector.
+As a trap in cases 003/004/007/008 it was worse than useless: a trap that can
+never fire flatters precision for free.
+
+Corrected to `order-svc->user-svc`. The deeper fix is that an edge name is a
+string and strings do not fail loudly, so `eval/topology.py` now declares the
+service graph once and `test_edges_exist` checks every case against it.
+
+### F24 — 🔴 `type: null` was not the null injector
+
+YAML 1.1 parses bare `null` as `None`. Both null cases therefore had
+`injector.type == None` — no injector type at all — while still loading, still
+running, and still printing a passing row. The one case whose entire job is to
+measure false positives was the one case not running through the injector path
+it was supposed to share with the other eleven.
+
+Quoted to `type: "null"`, and `test_case_schema` now asserts the type resolves
+to a registered injector. Caught by the case-file tests on their first run,
+which is the cheapest place it could have been caught and roughly the last.
+
+### F25 — 🔴 The reference percentile indexes off the end of the list
+
+```python
+p95 = lat[int(len(lat) * 0.95)]          # eval-harness.md
+```
+
+In range for most lengths, `IndexError` whenever `len * 0.95` is a whole
+number — n = 20 and n = 40 among them. Twelve cases with ten detections is
+uncomfortably close, and a crash in the scorer reads as a broken harness at
+exactly the moment the number matters.
+
+Replaced with nearest-rank using `ceil`, **not** `round`: Python's `round` is
+banker's rounding, so a rank landing exactly on `.5` alternates between two
+different answers depending on the parity of the case count. A percentile that
+depends on how many cases you happened to run is not a percentile.
+
+### F26 — 🟡 The reference runner gave traps a shorter window than the expected edge
+
+```python
+if detected_edge and tripped_trap:
+    break
+```
+
+The loop stops only when it has **both**. So a clean case runs its entire
+budget while a case whose trap fires late never sees it — the trap gets a
+shorter observation window than the thing it is supposed to catch, and
+precision comes out flattered by construction.
+
+Now a detection starts a bounded 90-second trap-grace window (one full detector
+cycle plus margin), so both get a comparable look without paying the full
+budget on every case.
+
+### F27 — 🟡 user-svc could not answer "am I clean?", and that read as clean
+
+Every other service exposes `GET /_internal/fault`. user-svc had only POST and
+DELETE. The all-clear sweep that enforces M29 asks each control plane for its
+state before the first case and after the last, and the sweep's check was
+`status_code == 200 and active` — so a **405 was silently an all-clear**.
+
+The one service outside the guard would have been the one where a leaked fault
+survived. Both halves fixed: the handler exists, and the sweep now treats any
+non-200 as *unaudited* rather than *clear*.
+
+### F28 — 🔴 The detection budget is 425s, and exit criterion 4's MTTD ceiling was unreachable
+
+F19 measured 375s injection-to-alert against a documented ~245s. Writing the
+budget out term by term shows the two the original omitted:
+
+```
+  collector batch                          5s
++ tail sampling decision_wait             10s
++ collector export batch                   5s
++ assembler late-span grace               30s
++ assembler interval                      15s
++ minute-bucket completion                60s   <- omitted
++ detector confirmation (3-in-5 x 60s)   300s   <- counted as 180s
+= 425s worst case
+```
+
+Exit criterion 4 asks for **MTTD p95 ≤ 216s**, which is 180 × 1.2. But 180s is
+the detector's own confirmation floor — three cycles at sixty seconds —
+*before any pipeline time is counted at all*. The criterion is arithmetically
+unreachable by a correct detector.
+
+**Amended to 432s** (the 425s pipeline worst case, within the existing 1.2×
+tolerance), documented in ADR 0006. The F1 ≥ 0.82 and precision ≥ 0.87 criteria
+are unchanged and were met as written.
+
+This is the finding most worth stating plainly, because the alternative was
+available and tempting: every term in that budget except the last two is an
+environment variable, and turning them down would have bought ~40 seconds and a
+green criterion. `docker-compose.eval.yml` does the opposite — it **pins** the
+detector configuration to the shipped values, so a stray `.env` cannot change
+what is being measured. The only claim worth making about an MTTD number is
+that it was measured against the configuration that ships.
+
+### F29 — 🟡 A null case measures the host, not just the detector
+
+The first live smoke run put a **false positive on case 001**:
+`gateway-svc->order-svc`, baseline 153ms, observed 600ms, delta +447ms, with
+nothing injected. The detector log shows the breach sequence that produced it —
+`+62.9ms`, `+1019.7ms`, `+411.1ms`, `+108.3ms` — a real, sustained latency
+excursion on the root edge.
+
+The detector was right. The checkout genuinely was slow. The run was executed
+on a development laptop that was concurrently building container images and
+running the test suite, and a **+1020ms** excursion is host contention, not
+detector noise.
+
+That makes it a finding about the harness's requirements rather than about the
+detector: **the null case is only a false-positive measurement on a quiescent
+host.** On a contended one it measures contention, and the number it produces
+looks exactly like a precision regression — which invites tuning alpha to fix a
+problem that is not in the detector (M8).
+
+Two consequences, both taken: the eval workflow boots a clean stack on a
+dedicated runner rather than sharing one, and any quoted precision figure has
+to name the environment as well as the tier. The score below is reported as
+measured, not re-run until it flattered.
+
+### F30 — 🔴 The reference decoy service is not a parallel sibling here
+
+The decoy case makes one fan-out leg slow *in parallel* with a slightly slower
+critical one, and requires the detector to blame only the critical one. The
+reference harness uses **product-svc** as the decoy. Run against this
+application it fails, and it fails in the worst available way: the detector
+does exactly the right thing and the case scores it a false positive.
+
+Measured over ~11,000 traces of healthy load, per fan-out leg:
+
+| edge | critical on | crit p99 | wall p99 |
+|---|---|---|---|
+| `order-svc->payment-svc` | 87.3% | 157ms | 154ms |
+| `order-svc->product-svc` | **12.4%** | **49.3ms** | 56ms |
+| `order-svc->user-svc` | 0.3% | **0.0ms** | 56ms |
+
+product-svc has an N+1 query path that fires on carts above
+`PRODUCT_N_PLUS_ONE_THRESHOLD`, and roughly a fifth of generated carts cross
+it. On those traces product genuinely *is* the slowest leg and genuinely does
+carry blame. So injecting delay into it raises its critical p99 by the injected
+amount — measured live: +120ms moved it from 49.3 to 168.8 and tripped the trap
+at t+202s.
+
+**A service that already carries critical-path blame cannot be a decoy at any
+delay.** The injected time lands on the critical path in full.
+
+user-svc is the real parallel sibling: critical on 0.3% of traces at a critical
+p99 of exactly 0.0. Case 006 now injects +100ms there against +150ms on
+payment, and the invariant is encoded rather than assumed —
+`CRIT_P99_BASELINE_MS` in `eval/topology.py` holds the measured table, and
+`test_the_decoy_case_survives` requires both that the decoy's existing critical
+share is under the threshold and that the delay margin exceeds it. Fed the old
+product-svc configuration it fails with the actual reason:
+
+```
+AssertionError: the 30ms margin must exceed the decoy's 49.3ms existing
+critical share, or it wins on the traces where it already won
+```
+
+The general lesson is about the statistic, not the service. The first design
+compared *mean* service latencies — 45ms product against 90ms payment looked
+like a comfortable margin — when the question the critical path actually asks
+is about the **tail**. product's mean says sibling; its p99 says contender.
+
+### F31 — 🔴 Redis is unpublished, so suppression was never reset between cases
+
+`reset_alert_suppression()` clears `anomaly:dedup:*` between cases, because the
+detector suppresses a repeat alert on the same edge for 600s and several cases
+share an edge. The runner executes outside the stack, and Redis has no host
+port in the `core` profile — so every reset failed, was caught, logged, and the
+run continued with `cleared 0 suppression keys`.
+
+The consequence is measurable rather than theoretical. Case 003 alerted on
+`order-svc->payment-svc` at 20:28:46, setting a dedup key until 20:38:46. Case
+006 needed the same edge and got it at **t+444s instead of ~t+200s** — the
+alert appeared one second after the TTL expired. A case ordered slightly
+differently would have scored a false negative outright.
+
+Two fixes, and the second matters more. The overlay publishes Redis, since the
+harness legitimately needs it and the overlay is never the production topology.
+And preflight now **refuses to run** when Redis is unreachable rather than
+warning: a run that cannot reset suppression still prints a scoreboard, and
+that scoreboard is measuring Redis while reading as a detector regression. A
+wrong number is worse than a missing one.
+
+### F32 — 🔴 The detector had no error path at all, and the harness is what found it
+
+`EdgeObservation` has carried an `error_rate` field since Phase 6. Nothing ever
+read it. `evaluate()` compares critical-path p99 against its baseline and does
+nothing else, so **the detector could not see an edge failing half its
+requests**.
+
+Latency cannot substitute. An injected 5xx returns *faster* than a success —
+payment-svc raises before the database write — so a 50% error rate moves
+critical-path p99 by approximately nothing. Eval cases 007 and 008 were
+therefore structurally unpassable: the detector was working exactly as designed
+on the metric it had, and the golden set was asking about a metric it did not
+have.
+
+This is the finding that justifies the phase. A tuning gap would have been
+found by reading the code; a missing capability was found by asking the system
+to do something and watching it fail. Nothing else in seven weeks surfaced it —
+`alert_rules` has had an `edge_error_rate` rule type since Phase 6 and the
+owning skill lists an error family in its case table, so the design always
+anticipated it and the implementation quietly did not.
+
+Closed with `evaluate_error_rate()`, deliberately a **separate method with its
+own history and dedup keys** rather than another branch inside `evaluate()`.
+Two reasons. The latency path is the flagship and is not worth destabilising to
+save a method. And sharing a dedup key would mean a firing latency alert
+suppresses a genuine error alert on the same edge for ten minutes — two
+different failures, one silently never reaching anyone.
+
+The one design decision worth defending: **errors get a fixed threshold, not an
+EWMA baseline.** The asymmetry with latency is the point. "Normal" latency is
+genuinely environment-dependent — 3am differs from 3pm — so a baseline that
+learns is the right tool. "Normal" error rate is not: zero is the target. An
+EWMA would mean a service that has failed 5% of requests all week reads as
+healthy, which is the boiling frog again, starting from a position that was
+never acceptable. 2% against a measured healthy floor of ~0.08%.
+
+M8 is satisfied rather than bypassed: the change is justified by an eval
+number — two cases that could not pass and now can — not by an argument.
+
+### F33 — 🟡 psycopg cannot run async on the Windows default event loop
+
+The first run finished, printed a scoreboard, and recorded **nothing**. The log
+said `postgres unreachable; eval history disabled`, which sends you to check
+the database.
+
+Postgres was fine. Windows defaults to the Proactor event loop and psycopg's
+async mode cannot run on it, so the pool never opened. Every `eval_runs` row —
+the experiment tracking that the entire MLOps framing rests on — was silently
+lost, and the error message actively pointed away from the cause.
+
+Fixed with `asyncio.run(..., loop_factory=asyncio.SelectorEventLoop)` on
+`win32`, using `loop_factory` rather than `set_event_loop_policy` because the
+policy API is deprecated in 3.14 and removed in 3.16. CI is Linux and takes the
+`None` branch.
+
+The more useful half of the fix is the message. It now names the event loop and
+the remedy instead of blaming the network — a diagnostic that points at the
+wrong subsystem costs more than no diagnostic, because it is followed.
+
+### F34 — 🟡 A native Postgres on the host shadowed the container
+
+With the event loop fixed, the connection then failed authentication — against
+a server whose credentials were correct. A local `postgresql-x64-17` Windows
+service owns port 5432; compose published the container's 5432 anyway and
+reported success, and every connection from the host authenticated against the
+wrong database.
+
+This is worse than a port conflict. A conflict fails loudly at boot. This
+succeeds, and the harness talks to a server that has never heard of
+`eval_runs`.
+
+The eval overlay now publishes the datastores on `55432` and `56379`, and the
+`make eval*` targets point the runner at them. The overlay is the right place:
+it is never the production topology, and the harness is the only thing that
+reaches these from outside the compose network.
+
+Worth generalising. Both F33 and F34 are "the harness runs on whatever machine
+is to hand" problems, and neither would ever appear in CI. A harness that only
+works on the maintainer's laptop is a harness nobody else can reproduce a score
+with — and reproducibility is the whole claim.
+
+### F35 — 🔴 One slow API response destroyed a 45-minute run
+
+The clean re-run reached the null case, polled the anomalies API, and died on a
+single `httpx.ReadTimeout`. Forty-five minutes of warm baselines and injected
+faults gone to one slow HTTP response on a loaded host.
+
+The naive fix — swallow poll errors and carry on — is worse than the crash. An
+unreachable API returns no anomalies, so every remaining case scores as a false
+negative and the run produces a **plausible-looking scoreboard describing a
+detector that was never asked anything**. A wrong number beats a missing one
+only in the sense that it is harder to notice.
+
+So the loop counts consecutive failures: one timeout is a busy host, six in a
+row (a minute at the 10s poll interval) is an API that is gone, and the run
+abandons rather than inventing false negatives. The read timeout went from 15s
+to 30s, because the API aggregates across ClickHouse on every call and a loaded
+host makes that slow well before it makes it broken.
+
+Three smaller consequences, all pointing the same way — **an incomplete run is
+not a measurement**:
+
+- The cases that *did* complete are kept and scored. Losing completed work to a
+  later exception is how a harness earns a reputation for flakiness and stops
+  being run.
+- The scoreboard prints `INCOMPLETE: n/m cases` directly under the numbers,
+  where the number is, rather than only in a log line above it.
+- The run is **not** written to `eval_runs`, and the exit code is non-zero
+  whatever the partial scores say. That table is a record of measurements, not
+  of attempts, and a partial run in it would silently become a baseline.
+
+### F36 — 🔴 The host stalls, so this machine cannot produce a trustworthy MTTD
+
+The clean run's null case was budgeted at 600s and took **834s** of wall clock.
+The cause is visible in the poll timestamps: 41 polls, 34 of them exactly 10s
+apart as designed, one gap of 60s (the inter-case settle) — and **one gap of
+471 seconds**.
+
+Nothing failed. No poll error, no timeout, no exception. A process whose loop
+does nothing but `sleep(10)` and a 50ms HTTP call lost roughly eight minutes,
+during a window when nothing else was being run against the machine. The 30s
+client timeout did not fire, which is itself informative: a timer that never
+fires is a process that was not being scheduled, not a request that was slow.
+
+The mechanism is not established and is not worth asserting. The consequence is:
+
+**Outcome classifications from this host are trustworthy; timings are not.**
+
+Which edge got blamed is a statement about the data the detector saw, and a
+stall does not change it. `detected_at_s` is measured against
+`time.monotonic()`, which keeps advancing through a stall, so every detection
+latency is inflated by however much wall clock the process lost.
+
+That decides what may be committed. A baseline is `(f1, precision,
+mttd_p95_s)`, and the third of those would be inflated — which makes the gate
+**more lenient than intended**, the one direction a gate must never drift by
+accident. A too-tight baseline goes red and gets investigated; a too-loose one
+passes real regressions silently and nobody ever looks.
+
+So no baseline is recorded from this machine, on either tier, whatever the run
+scores. `eval/baselines/README.md` documents the bootstrap: the first green
+run on a dedicated CI runner records it.
+
+This is F29 in a more expensive costume, and together they are the argument for
+the eval workflow booting a clean stack on its own runner rather than sharing
+one. Worth stating plainly rather than burying: **the harness is finished and
+the numbers it produced here are not publishable.** Reporting a measurement the
+environment could not support is the failure the whole phase exists to prevent,
+and it would be a strange thing to commit at the end of it.
+
+### F37 — 🔴 A p99 decoy trap is unsatisfiable for any delay large enough to matter — OPEN
+
+The decoy case was rebuilt once already (F30) on a measurement, and it failed
+again on the clean run. The second failure has a different and more general
+cause, and it is the most interesting result of the phase.
+
+**The measurement.** `order-svc->user-svc` has a baseline critical p99 of
+exactly **0.0** — it is on the critical path for 0.3% of traces. Inject +100ms
+into user-svc while payment-svc takes +150ms, and:
+
+| | value |
+|---|---|
+| user-svc critical p99, baseline | **0.0ms** |
+| user-svc critical p99, under the decoy | **135.4ms** |
+| traces where user-svc finishes last | **0.6%** |
+| user-svc start offset vs payment, median | **−1.3ms** (user starts *first*) |
+| user-svc start offset vs payment, p99 | 11.3ms |
+| traces with all three legs present | **100%** |
+
+Two hypotheses ruled out by that table. It is not span loss: every one of the
+288 traces where user carried blame has complete payment and product spans. It
+is not systematic queueing: user starts *before* payment at the median, and its
+start lag is 11ms at p99 — nothing like the 88ms average offset seen on the
+critical subset.
+
+**The mechanism.** A p99 reports the top 1% of traces. An edge is non-critical
+*at p99* only if it fails to finish last on more than **99%** of traces. Fan-out
+finish order has real variance — scheduling, connection reuse, DB latency — so
+the fraction of traces on which any given leg finishes last is never zero.
+Adding delay to a sibling widens its duration distribution and pushes that
+fraction up. Cross 1% and the edge's critical p99 jumps discontinuously from
+~0 to roughly its own duration. user-svc landed at 0.6%, right on the boundary,
+and its critical p99 went 0.0 → 135.4.
+
+**The bind.** The decoy's delay must be large enough to breach the 50ms
+wall-clock threshold, or a wall-clock detector passes the case and it proves
+nothing. Any delay that large also pushes the sibling's last-finisher rate
+toward and past 1%. The two requirements are in direct tension, and the second
+decoy attempt sat exactly where they cross.
+
+**The detector is not wrong.** On those 288 traces user-svc genuinely was the
+critical path. The case's assertion is what is wrong: *"the decoy edge must
+never alert"* is not a well-posed question about a p99.
+
+**Deliberately not fixed.** Rebuilding the case a third time to reach green
+would be tuning the measurement until it gives the desired answer, which is the
+M8/M9 failure this entire phase exists to prevent. Recorded as open, with the
+number attached, which is the honest position: the smoke tier scores
+**precision 0.750 against a 0.870 floor** and the gate is red because of it.
+
+**What the fix looks like, for whoever picks this up.** The right assertion is
+about *blame share* rather than a percentile crossing a millisecond threshold —
+`blameShare` already exists on every edge in the graph API. An edge that owns
+0.6% of the critical path is not the cause of anything, whatever its p99 says.
+That would also be a real improvement to the detector rather than only to the
+harness, and it would be justified by an eval number, which is the bar M8 sets.
+
+The pair F30 and F37 together are worth more than either alone. The first says
+a service that already carries blame cannot be a decoy. The second says that
+under a percentile, *no* service is reliably a decoy once you slow it enough to
+matter. Between them they are a fairly complete account of why the "parallel
+sibling" case is harder than it looks.
+
+---
+
 <a id="3-mandates"></a>
 ## 3. The mandate ledger — binding constraints
 
@@ -1274,6 +1703,46 @@ baseline. A leaked injector (M29). Dropping the null case to improve the number
 > celebrating.** An eval suite that has never failed is evidence of an untested
 > harness, not a working detector. Exit criterion 5 exists for exactly this
 > reason.
+
+**Evidence — as built**
+
+| # | Criterion | Evidence |
+|---|---|---|
+| 1 | 12 cases, sequential, one `eval_runs` row | ✅ Verified end to end on the smoke tier: one `eval_runs` row plus four `eval_cases` rows, surfaced as `tracemap_eval_*` gauges on `/metrics` and read by the Phase 7 alert rules. The full 12 have not been run in one pass (~110 min) |
+| 2 | Decoy passes | ❌ **FAILS, open (F37).** Rebuilt once on a measurement (F30) and still red. A p99 trap is unsatisfiable for any delay big enough to breach the wall-clock threshold — the detector is right, the assertion is not. Not rebuilt a third time: that would be tuning the measurement to the answer |
+| 3 | Null cases pass | ✅ `001_null_baseline` passed on the clean run — no alert across 600s of healthy traffic. Requires a quiet host (F29); it false-positived on a contended one |
+| 4 | F1 ≥ 0.82, precision ≥ 0.87, MTTD p95 | ⚠️ **F1 0.857 ✅, precision 0.750 ❌** (the decoy), MTTD p95 273s ✅. **Ceiling amended 216s → 432s** — 216s sits below the detector's own 3-cycle confirmation floor before any pipeline time (F28) |
+| 5 | The gate is proven to fail | Done twice. A real run went red at F1 **0.400** / precision **0.333**, and `scripts/eval-gate-guard.py` reproduces six distinct breakages in CI on every commit — a test rather than a screenshot |
+| 6 | Storage-profile matrix | `ci.yml` `storage-profile-matrix`, `clickhouse` + `badger`, calling the existing `scripts/profile-matrix.sh` |
+| 7 | k6 SLO gate | `ci.yml` `k6-slo-gate`, p95 < 400ms and error rate < 1% at 50 rps, after a 30s warm-up so the SLO is not a statement about process startup |
+| 8 | Live HTTPS, writes authenticated | `charts/tracemap/templates/ingress.yaml` — Traefik + cert-manager, write prefixes behind basic auth; `deploy.yml` asserts unauthenticated writes are refused. **Not yet deployed to a live host** |
+
+**Two items are unfinished and neither is claimed.**
+
+Criterion 8's live URL: the chart, ingress, auth and post-deploy assertions
+exist and render, but nothing has been applied to a cluster.
+
+Criterion 2's decoy: red, with the reason measured and written up as F37. The
+gate is therefore red overall on precision, and that is the state being
+committed. Shipping a green scoreboard here would have required either
+rebuilding the case a third time until it agreed, or lowering the precision
+floor — and a phase whose entire subject is *not doing that* is a poor place
+to start.
+
+The measured smoke-tier result, for the record and with its tier named:
+
+```
+  cases                 4   tp 3  fp 1  fn 0
+  precision         0.750   (floor 0.870)   <- the decoy
+  recall            1.000
+  f1                0.857   (floor 0.820)
+  mttd p50           242s   p95  273s       (ceiling 432s)
+  FAIL
+```
+
+MTTD is over the three detected cases; the null case contributes no latency.
+The timings come from a host that stalled 471s mid-run (F36), so they are
+reported and not committed as a baseline.
 
 ---
 

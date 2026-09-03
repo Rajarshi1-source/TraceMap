@@ -86,7 +86,7 @@ async def run_forever(
             LAST_SUCCESS.labels(worker=name).set(time.time())
             if processed:
                 ITEMS.labels(worker=name).inc(processed)
-        except Exception:  # noqa: BLE001 - log and continue, NEVER re-raise
+        except Exception:  # broad by design: log and continue, NEVER re-raise
             FAILURES.labels(worker=name).inc()
             log.exception("%s cycle failed", name)
         finally:

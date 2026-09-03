@@ -1,5 +1,19 @@
 # TraceMap eval harness — golden set, runner, scorer, CI
 
+> **Corrected against the built harness, Phase 7.** This document was written
+> before the harness existed, and building it found six defects *in this
+> document*. They are marked **CORRECTED** inline, each with the measurement
+> that overturned it. The authority is now `eval/`; this is the narrative.
+>
+> The four worth knowing before reading anything else:
+>
+> | Was | Is | Why |
+> |---|---|---|
+> | case 009 edge `gateway-svc->user-svc` | `order-svc->user-svc` | that edge does not exist — the fan-out lives in order-svc (F23) |
+> | decoy = product-svc | decoy = user-svc | product carries critical-path blame on 12.4% of traces, so it is not a sibling (F30) |
+> | budgets 120–180s | 480s | 425s pipeline worst case; 180s is below the detector's own confirmation floor (F28) |
+> | MTTD p95 baseline 180s | 432s | same reason (F28) |
+
 Contents:
 1. Directory layout
 2. The twelve golden cases
@@ -34,21 +48,42 @@ eval/
 |---|---|---|---|---|
 | 1 | `001_null_baseline` | Null | `none` | 600s quiet |
 | 2 | `002_null_traffic_ramp` | Null | `none` | 600s quiet under 2x load ramp |
-| 3 | `003_payment_latency_60ms` | Latency | `order-svc->payment-svc` | 180s |
-| 4 | `004_payment_latency_200ms` | Latency | `order-svc->payment-svc` | 150s |
-| 5 | `005_product_latency_800ms` | Latency | `order-svc->product-svc` | 120s |
-| 6 | `006_parallel_decoy` | **Decoy** | `order-svc->payment-svc` | 180s |
-| 7 | `007_payment_errors_10pct` | Error | `order-svc->payment-svc` | 180s |
-| 8 | `008_payment_errors_50pct` | Error | `order-svc->payment-svc` | 120s |
-| 9 | `009_user_cpu_saturation` | Saturation | `gateway-svc->user-svc` | 240s |
-| 10 | `010_payment_db_down` | Dependency kill | `order-svc->payment-svc` | 120s |
-| 11 | `011_deploy_correlated` | Deploy | `order-svc->payment-svc` | 180s |
-| 12 | `012_gateway_latency_cascade` | Cascade | `gateway-svc->order-svc` | 180s |
+| 3 | `003_payment_latency_60ms` | Latency | `order-svc->payment-svc` | 480s |
+| 4 | `004_payment_latency_200ms` | Latency | `order-svc->payment-svc` | 480s |
+| 5 | `005_product_latency_800ms` | Latency | `order-svc->product-svc` | 480s |
+| 6 | `006_parallel_decoy` | **Decoy** | `order-svc->payment-svc` | 480s |
+| 7 | `007_payment_errors_10pct` | Error | `order-svc->payment-svc` | 480s |
+| 8 | `008_payment_errors_50pct` | Error | `order-svc->payment-svc` | 480s |
+| 9 | `009_user_cpu_saturation` | Saturation | `order-svc->user-svc` **CORRECTED** | 480s |
+| 10 | `010_payment_db_down` | Dependency kill | `order-svc->payment-svc` | 480s |
+| 11 | `011_deploy_correlated` | Deploy | `order-svc->payment-svc` | 480s |
+| 12 | `012_gateway_latency_cascade` | Cascade | `gateway-svc->order-svc` | 480s |
 
-Case 6 is the one that justifies the whole critical-path feature: product-svc
-is made slow *in parallel* with a slightly slower payment-svc. A wall-clock
+Case 6 is the one that justifies the whole critical-path feature: a sibling is
+made slow *in parallel* with a slightly slower payment-svc. A wall-clock
 detector alerts on both and scores a false positive. Only critical-path
 attribution gets it right.
+
+**CORRECTED — the decoy is user-svc, not product-svc.** Measured over ~11,000
+traces of healthy load:
+
+| edge | critical on | crit p99 |
+|---|---|---|
+| `order-svc->payment-svc` | 87.3% | 157ms |
+| `order-svc->product-svc` | **12.4%** | **49.3ms** |
+| `order-svc->user-svc` | 0.3% | **0.0ms** |
+
+product-svc has an N+1 query path that fires on large carts, so on those traces
+it genuinely *is* the slowest leg and genuinely does carry blame. A service that
+already carries critical-path blame cannot be a decoy **at any delay** — the
+injected time lands on the critical path in full. Measured live: +120ms on
+product moved its critical p99 from 49.3 to 168.8 and tripped the trap, scoring
+a correct detector as a false positive.
+
+The trap in the original design is subtle and general: it compared *mean*
+service latencies, where 45ms against 90ms looks like a comfortable margin. The
+critical path is a question about the **tail**. product's mean says sibling; its
+p99 says contender.
 
 Cases 1 and 2 are the false-positive measurement. Case 2 matters because a
 traffic ramp changes latency distributions legitimately — a detector that
@@ -83,16 +118,29 @@ expect:
 ```
 
 `detect_within_s` must be derived from the real pipeline budget, not chosen
-optimistically:
+optimistically. **CORRECTED** — the original derivation omitted minute-bucket
+completion and counted the sustained window as 3 cycles rather than the 5 it
+spans:
 
 ```
-collector batch (5s)
-+ tail sampling decision_wait (10s)
-+ collector export batch (5s)
-+ assembler grace (30s) + assembler interval (15s)
-+ detector interval (60s) x sustained_cycles (3)
-= ~245s worst case, ~120-180s typical
+  collector batch                          5s
++ tail sampling decision_wait             10s
++ collector export batch                   5s
++ assembler late-span grace               30s
++ assembler interval                      15s
++ minute-bucket completion                60s   <- omitted
++ detector confirmation (3-in-5 x 60s)   300s   <- was counted as 180s
+= 425s worst case
 ```
+
+Phase 6 measured 375s injection-to-alert against a documented ~245s. Every
+fault case therefore gets 480s.
+
+The consequence worth stating plainly: **a 180s budget is unreachable by a
+correct detector**, because the detector's own confirmation window is already
+180s before any pipeline time is counted at all. A gate nothing can pass goes
+red on a working detector, and the natural response to a red gate is to weaken
+the thing being gated.
 
 If a budget is tighter than that, the case measures your patience rather than
 the detector. Either widen the budget or reduce `sustained_cycles` for the
@@ -169,6 +217,12 @@ async def run_case(case: dict, api, pg) -> dict:
                 if edge == expected_edge and detected_edge is None:
                     detected_edge = edge
                     detected_at = time.monotonic() - t0
+            # CORRECTED. This stops only when BOTH have happened, so a
+            # clean case runs its whole budget while a case whose trap fires
+            # late never sees it -- the trap gets a shorter window than the
+            # thing it is meant to catch, and precision comes out flattered.
+            # The built runner starts a bounded 90s trap-grace window on
+            # detection instead, so both get a comparable look.
             if detected_edge and tripped_trap:
                 break
     finally:
@@ -227,7 +281,7 @@ alert pointing at the wrong service costs on-call time the same way.
 
 ```python
 # eval/scorer.py
-BASELINE  = {"f1": 0.85, "precision": 0.90, "mttd_p95_s": 180.0}
+BASELINE  = {"f1": 0.85, "precision": 0.90, "mttd_p95_s": 360.0}  # CORRECTED from 180
 TOLERANCE = 0.03
 
 def score_run(results: list[dict]) -> Scores:
@@ -241,6 +295,10 @@ def score_run(results: list[dict]) -> Scores:
 
     lat = sorted(r["detected_at_s"] for r in results if r["detected_at_s"])
     p50 = median(lat) if lat else float("inf")
+    # CORRECTED. This raises IndexError whenever len * 0.95 is a whole
+    # number -- n = 20 and n = 40 among them. The built scorer uses
+    # nearest-rank with math.ceil (NOT round, which is banker's rounding in
+    # Python and makes the answer depend on the parity of the case count).
     p95 = lat[int(len(lat) * 0.95)] if lat else float("inf")
 
     passed = (f1 >= BASELINE["f1"] - TOLERANCE
@@ -339,6 +397,11 @@ produced any score you quote.
 | Decoy case passes with a wall-clock detector | Decoy is mis-built; the parallel service must not be the slowest |
 | MTTD suspiciously low | Budget started before load stabilised; measure from steady state |
 | Everything passes on the first try | Suspect the harness before celebrating — break the detector deliberately and confirm it goes red |
+| Error cases never detect | The detector may have no error path at all. Latency percentiles cannot see a fast 5xx: an injected error returns *faster* than a success, so critical-path p99 does not move (F32) |
+| A decoy case fails against a detector that looks correct | The decoy service probably carries critical-path blame already. Check its critical p99 on healthy traffic; if it is not ~0 it cannot be a decoy (F30) |
+| `type: null` behaves oddly | YAML 1.1 parses bare `null` as None, so the injector type silently becomes absent. Quote it (F24) |
+| Cases sharing an edge fail in sequence | Alert-suppression state was not reset between them; the dedup TTL outlives the settling gap (F31) |
+| Runs record no history on Windows | psycopg cannot run async on the Proactor event loop, and the error says "postgres unreachable" (F33). A native Postgres on 5432 will also shadow the container (F34) |
 
 That last row is the important one. An eval suite that has never failed is not
 evidence of a working detector; it is evidence of an untested harness.

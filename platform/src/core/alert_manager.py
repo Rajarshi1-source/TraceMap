@@ -39,21 +39,37 @@ def build_blocks(a: Anomaly, deploy: DeployCorrelation,
         for t in traces[:5]
     ) or "_no sample traces in window_"
 
+    # An error-rate anomaly carries RATES in the same fields a latency one
+    # carries milliseconds. Rendering 0.1 as "0ms" would be worse than not
+    # alerting at all: it reads as a measurement rather than as a mistake.
+    if a.metric == "error_rate":
+        headline = f"Error-rate regression: {a.source} -> {a.target}"
+        primary = {"type": "mrkdwn",
+                   "text": f"*Error rate*\n{a.observed_ms * 100:.1f}% "
+                           f"(threshold {a.baseline_ms * 100:.1f}%)"}
+        secondary = {"type": "mrkdwn",
+                     "text": f"*Failing requests*\n"
+                             f"~{round(a.observed_ms * a.request_count):,} "
+                             f"of {a.request_count:,}"}
+    else:
+        headline = f"Latency regression: {a.source} -> {a.target}"
+        # Critical path FIRST. This ordering is the whole point.
+        primary = {"type": "mrkdwn",
+                   "text": f"*Critical-path p99*\n{a.observed_ms:.0f}ms "
+                           f"(baseline {a.baseline_ms:.0f}ms, +{a.delta_ms:.0f}ms)"}
+        secondary = {"type": "mrkdwn",
+                     "text": f"*Wall-clock p99*\n{a.wall_p99_ms:.0f}ms"}
+
     blocks: list[dict] = [
         {
             "type": "header",
-            "text": {"type": "plain_text",
-                     "text": f"Latency regression: {a.source} -> {a.target}"},
+            "text": {"type": "plain_text", "text": headline},
         },
         {
             "type": "section",
             "fields": [
-                # Critical path FIRST. This ordering is the whole point.
-                {"type": "mrkdwn",
-                 "text": f"*Critical-path p99*\n{a.observed_ms:.0f}ms "
-                         f"(baseline {a.baseline_ms:.0f}ms, +{a.delta_ms:.0f}ms)"},
-                {"type": "mrkdwn",
-                 "text": f"*Wall-clock p99*\n{a.wall_p99_ms:.0f}ms"},
+                primary,
+                secondary,
                 {"type": "mrkdwn",
                  "text": f"*Requests*\n{a.request_count:,} in window"},
                 {"type": "mrkdwn",
@@ -117,7 +133,7 @@ class AlertManager:
                     "deployFound": deploy.found,
                     "traces": traces[:5],
                 }))
-            except Exception:  # noqa: BLE001 - a broken feed must not eat the alert
+            except Exception:  # broad by design: a broken feed must not eat the alert
                 log.exception("failed to publish alert to the SSE channel")
 
         if not self.webhook:
@@ -131,7 +147,7 @@ class AlertManager:
             if not ok:
                 log.error("slack rejected the alert: %s %s", r.status_code, r.text[:200])
             return {"delivered": ok, "status": r.status_code, "blocks": blocks}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # An alerting outage must never take down the detector: the next
             # cycle still needs to run.
             log.exception("slack delivery failed")

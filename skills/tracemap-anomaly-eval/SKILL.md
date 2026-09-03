@@ -132,10 +132,14 @@ load:
   rps: 20
 expect:
   edge: "order-svc->payment-svc"
-  detect_within_s: 180          # 3 detector cycles + assembly lag
+  detect_within_s: 480          # see the budget below - NOT 180
   must_not_alert:
+    # Siblings only. Ancestors are expected to get slower: an edge's
+    # critical-path time includes its callee's whole subtree, so a payment
+    # slowdown really does make gateway-svc->order-svc slower, and saying so
+    # is correct attribution rather than a false positive.
     - "order-svc->product-svc"
-    - "gateway-svc->user-svc"
+    - "order-svc->user-svc"
 ```
 
 Scoring, outcome taxonomy, the runner and the CI wiring are in `references/eval-harness.md`. Read it before adding cases or changing thresholds.
@@ -145,7 +149,31 @@ Non-negotiables when writing injectors and the runner:
 - **Always stop the injector in a `finally` block.** A leaked fault poisons every subsequent case and you will spend an evening confused.
 - **Sleep ~60s between cases** so baselines settle; otherwise case N's fault is case N+1's baseline.
 - **Warm baselines before the first case** with several minutes of clean load, or the warmup gate makes every case a false negative.
-- **Set `detect_within_s` from the real pipeline budget** — collector batch plus sampling decision plus assembler grace plus detector interval. A budget tighter than the pipeline measures nothing but your patience.
+- **Set `detect_within_s` from the real pipeline budget.** Measured, not estimated — the first two attempts at this number were both wrong in the same direction:
+
+  ```
+    collector batch                          5s
+  + tail sampling decision_wait             10s
+  + collector export batch                   5s
+  + assembler late-span grace               30s
+  + assembler interval                      15s
+  + minute-bucket completion                60s   <- routinely omitted
+  + detector confirmation (3-in-5 x 60s)   300s   <- often counted as 180s
+  = 425s worst case
+  ```
+
+  The detector's own confirmation window is already 180s before any pipeline
+  time is counted, so a 180s budget can never be met by a correct detector. A
+  budget tighter than the pipeline does not measure the detector; it measures
+  your patience, and the natural response to the red result it produces is to
+  weaken the detector.
+
+- **Name edges against the real topology, not the diagram in your head.** The
+  fan-out lives in `order-svc`, so `user-svc` is a child of order-svc and
+  `gateway-svc->user-svc` does not exist. A case naming an impossible edge
+  injects a real fault, waits for an alert that can never arrive, and scores a
+  working detector as a false negative. Declare the graph in one place and
+  test every case against it.
 
 ## The CI gate
 
@@ -201,7 +229,7 @@ The detector dying quietly is the worst failure in the system — everything loo
 
 - *"I treated my detector like a model: a golden set of twelve injected faults including a null case for false positives and a decoy where a parallel sibling is slow but irrelevant, scored on precision, recall and MTTD, with CI blocking merges on regression. When I tuned alpha from 0.3 to 0.2 I didn't argue about it — I had a number."*
 - *"The baseline only learns from healthy observations. Fold anomalies in and a slow degradation becomes the new normal, and the detector goes blind."*
-- *"My MTTD is p95 under 180 seconds, and that's measured by injecting known faults, not estimated."*
+- *"My MTTD p95 is measured by injecting known faults, not estimated — and the first budget I wrote was wrong by 2x. The detector's confirmation window alone is three minutes, and about two more of collector batching, sampling decision wait, assembler grace and bucket completion sit in front of it. I moved the budget rather than the detector, because a gate a correct detector cannot pass teaches people to break the detector."*
 
 ## Pairing
 

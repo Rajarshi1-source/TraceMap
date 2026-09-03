@@ -73,7 +73,8 @@ def test_clean_trace_produces_one_row_per_edge():
 
 def test_duplicate_span_id_produces_exactly_one_row_per_edge():
     """The whole point: an at-least-once redelivery must not double-count."""
-    duplicated = FANOUT + [
+    duplicated = [
+        *FANOUT,
         _row("pay", "ord", "payment-svc", "charge", 10, 730),  # exact redelivery
     ]
     edge_rows = _edges(duplicated)
@@ -88,7 +89,7 @@ def test_duplicate_span_id_does_not_move_blame():
     before = {(e["source_service"], e["target_service"]): e["critical_ms"]
               for e in _edges(FANOUT)}
     after = {(e["source_service"], e["target_service"]): e["critical_ms"]
-             for e in _edges(FANOUT + [_row("pay", "ord", "payment-svc", "charge", 10, 730)])}
+             for e in _edges([*FANOUT, _row("pay", "ord", "payment-svc", "charge", 10, 730)])}
 
     assert before == after
     assert before[("order-svc", "payment-svc")] == 720.0

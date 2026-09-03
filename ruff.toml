@@ -1,0 +1,44 @@
+# Lint configuration, so `ruff check` in CI means one fixed thing rather than
+# whatever the installed version defaults to. A lint gate without a pinned rule
+# set fails the day ruff adds a rule, which teaches people to skip it.
+
+line-length = 100
+target-version = "py314"
+exclude = [".venv", "node_modules", ".next", "__pycache__"]
+
+[lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes - the ones that are actually bugs
+  "I",        # import order
+  "UP",       # pyupgrade; this repo is 3.14 only
+  "B",        # bugbear - mutable defaults, loop-variable capture
+  "ASYNC",    # blocking calls inside async functions
+  "SIM",      # obvious simplifications
+  "BLE",      # broad excepts - selected, not ignored, so the deliberate ones
+              # have to say WHY in a noqa rather than blending in
+  "RUF",
+]
+ignore = [
+  # Long lines inside comments and docstrings are deliberate here: the
+  # reasoning is the point, and rewrapping it to satisfy a linter costs more
+  # than it buys.
+  "E501",
+]
+
+# On BLE001: `except Exception` is load-bearing in the workers and the
+# injectors -- a monitoring system that stops monitoring because one cycle
+# raised has its priorities backwards, and a teardown that raises out of
+# `finally` loses the original error. It is SELECTED rather than ignored so
+# each deliberate one carries a `# noqa: BLE001` explaining itself. Ignoring
+# the rule globally would delete that explanation: ruff's RUF100 then reports
+# every such comment as an unused noqa and strips it.
+
+[lint.per-file-ignores]
+# Tests assert on private state on purpose - the point of an injector contract
+# test is to check the contract, including the bits that are not public.
+"eval/tests/*" = ["SLF001", "S101"]
+"**/tests/*" = ["SLF001", "S101"]
+
+[lint.isort]
+known-first-party = ["eval", "src", "workers"]

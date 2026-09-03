@@ -1,0 +1,26 @@
+name: null_traffic_ramp
+family: "null"
+description: >
+  Healthy traffic, doubled part-way through. Still no fault, still no alert.
+
+  Load changes latency distributions legitimately -- queueing is real, and p99
+  moves under a 2x ramp without anything being wrong. A detector that cannot
+  tell "more customers" from "a regression" pages someone every time marketing
+  sends an email. This is the case it fails.
+injector:
+  # QUOTED. Bare `null` is None in YAML, so an unquoted type here
+  # silently becomes a missing key and the case stops being a null
+  # case -- while still printing a passing row.
+  type: "null"
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+  # The runner launches a second load generator for `ramp_hold_s` starting at
+  # `ramp_after_s`, doubling offered load without touching any service.
+  ramp_multiplier: 2
+  ramp_after_s: 180
+  ramp_hold_s: 300
+expect:
+  edge: "none"
+  detect_within_s: 600
+  must_not_alert: ["*"]

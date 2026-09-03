@@ -14,6 +14,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+
+from prometheus_client import Counter, Gauge
 
 from src.cache.redis_cache import Cache
 from src.core.alert_manager import AlertManager
@@ -23,6 +26,29 @@ from src.core.query_engine import QueryEngine
 from src.integrations.clickhouse_client import ClickHouseClient
 from src.integrations.postgres_client import PostgresClient
 from workers._runner import run_forever, serve_metrics
+
+# An alert on a metric nothing emits is worse than no alert: Prometheus renders
+# "no data" as neither firing nor healthy, and everyone reads it as fine. These
+# three back the AlertVolumeSpike, DetectorSilentTooLong and baseline panels
+# added in Phase 7, and they exist because those rules were written first and
+# would otherwise have been decoration.
+ANOMALIES = Counter(
+    "tracemap_anomalies_emitted_total",
+    "Anomalies emitted, by edge and metric",
+    ["src", "dst", "metric"],
+)
+LAST_ANOMALY = Gauge(
+    "tracemap_last_anomaly_timestamp_seconds",
+    "Unix time of the most recent anomaly, any edge",
+)
+# The boiling frog, made visible. A baseline that has climbed to sit on top of
+# a known-degraded edge is the M6 failure, and it shows here before it shows
+# anywhere else -- by which point the detector has already gone quiet.
+EDGE_BASELINE = Gauge(
+    "tracemap_edge_baseline_ms",
+    "Current EWMA baseline for an edge's critical-path p99",
+    ["src", "dst"],
+)
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +78,9 @@ def config_from_env() -> DetectorConfig:
         # must say which value produced it.
         min_requests=int(os.environ.get("DETECTOR_MIN_REQUESTS", "100")),
         sustained_cycles=int(os.environ.get("DETECTOR_SUSTAINED_CYCLES", "3")),
+        # The error path's only knob. Fixed rather than learned, because zero
+        # is the target for errors in a way it never is for latency.
+        error_rate_threshold=float(os.environ.get("DETECTOR_ERROR_RATE_THRESHOLD", "0.02")),
         warmup_cycles=int(os.environ.get("DETECTOR_WARMUP_CYCLES", "5")),
     )
 
@@ -74,27 +103,64 @@ async def detect_once(engine: QueryEngine, detector: AnomalyDetector,
             request_count=e["requestCount"],
             error_rate=e["errorRate"],
         )
-        anomaly = await detector.evaluate(obs)
-        if anomaly is None:
-            continue
+        # Two independent questions about the same edge, each with its own
+        # history and dedup keys. An edge can be slow, failing, or both, and
+        # collapsing them would let one alert suppress the other.
+        for anomaly in (await detector.evaluate(obs),
+                        await detector.evaluate_error_rate(obs)):
+            if anomaly is None:
+                continue
 
-        # Ordered by critical_ms DESC inside slow_traces(). Ordering by wall
-        # clock would link to a trace where the edge was slow but parallel.
-        traces = await engine.slow_traces(anomaly.source, anomaly.target,
-                                          TRACE_LOOKUP_WINDOW_MIN, limit=5)
-        now = await ch.query("SELECT toString(now()) AS t")
-        deploy = await attribute(ch, anomaly.source, anomaly.target, now[0]["t"])
+            # Ordered by critical_ms DESC inside slow_traces(). Ordering by
+            # wall clock would link to a trace where the edge was slow but
+            # parallel.
+            traces = await engine.slow_traces(anomaly.source, anomaly.target,
+                                              TRACE_LOOKUP_WINDOW_MIN, limit=5)
+            now = await ch.query("SELECT toString(now()) AS t")
+            deploy = await attribute(ch, anomaly.source, anomaly.target,
+                                     now[0]["t"])
 
-        await alerts.send(anomaly, deploy, traces)
-        if pg is not None:
-            await _record(pg, anomaly, deploy, traces)
+            ANOMALIES.labels(src=anomaly.source, dst=anomaly.target,
+                             metric=anomaly.metric).inc()
+            LAST_ANOMALY.set(time.time())
 
-        log.info("ALERT %s +%.0fms (baseline %.0f) | %s",
-                 anomaly.edge, anomaly.delta_ms, anomaly.baseline_ms,
-                 deploy.summary())
-        fired += 1
+            await alerts.send(anomaly, deploy, traces)
+            if pg is not None:
+                await _record(pg, anomaly, deploy, traces)
 
+            if anomaly.metric == "error_rate":
+                log.info("ALERT %s error rate %.1f%% (threshold %.1f%%) | %s",
+                         anomaly.edge, anomaly.observed_ms * 100,
+                         anomaly.baseline_ms * 100, deploy.summary())
+            else:
+                log.info("ALERT %s +%.0fms (baseline %.0f) | %s",
+                         anomaly.edge, anomaly.delta_ms, anomaly.baseline_ms,
+                         deploy.summary())
+                fired += 1
+
+    await _export_baselines(detector)
     return fired
+
+
+async def _export_baselines(detector) -> None:
+    """Publish every edge's current baseline as a gauge.
+
+    One SCAN over a handful of keys per minute. Cheap, and it turns the single
+    most important piece of detector state from something you inspect with
+    redis-cli during an incident into something with a graph.
+    """
+    try:
+        async for key in detector.redis.scan_iter(match="baseline:edge:*:cp99",
+                                                  count=200):
+            parts = key.split(":")
+            if len(parts) != 5:
+                continue
+            value = await detector.redis.get(key)
+            if value is not None:
+                EDGE_BASELINE.labels(src=parts[2], dst=parts[3]).set(float(value))
+    except Exception:
+        # be the thing that stops the detector.
+        log.debug("could not export baselines", exc_info=True)
 
 
 async def _record(pg, anomaly, deploy, traces) -> None:
@@ -111,7 +177,7 @@ async def _record(pg, anomaly, deploy, traces) -> None:
                 "lagSeconds": deploy.lag_seconds, "confidence": deploy.confidence,
             }),
         ))
-    except Exception:  # noqa: BLE001 - never lose the alert over a bookkeeping failure
+    except Exception:
         log.exception("failed to record anomaly_event")
 
 
@@ -139,8 +205,14 @@ async def main() -> None:
     if pg is not None:
         await _apply_schema(pg)
     cfg = config_from_env()
-    log.info("detector armed: alpha=%.2f threshold=%.0fms min_requests=%d sustained=%d",
-             cfg.alpha, cfg.threshold_ms, cfg.min_requests, cfg.sustained_cycles)
+    # The model artifact, in the log. `eval_runs.detector_cfg` records it per
+    # run; this is so the config is legible from a container's first ten lines
+    # rather than only from a database.
+    log.info("detector armed: alpha=%.2f threshold=%.0fms min_requests=%d "
+             "sustained=%d/%d error_rate>%.1f%%",
+             cfg.alpha, cfg.threshold_ms, cfg.min_requests,
+             cfg.sustained_cycles, cfg.sustained_window,
+             cfg.error_rate_threshold * 100)
 
     await run_forever(
         "anomaly_detector",
@@ -156,13 +228,16 @@ async def _apply_schema(pg) -> None:
     CREATE TABLE IF NOT EXISTS it is ceremony. The SQL lives in a file rather
     than a string so it stays reviewable.
     """
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    # Blocking file I/O inside an async function, once, at startup, before the
+    # loop has anything to do. Pulling in aiofiles to avoid stalling an event
+    # loop that is otherwise idle would be machinery for its own sake.
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # noqa: ASYNC240
                         "db", "001_platform.sql")
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:  # noqa: ASYNC230
             await pg.execute_script(fh.read())
         log.info("platform schema applied")
-    except Exception:  # noqa: BLE001
+    except Exception:
         log.exception("failed to apply platform schema")
 
 

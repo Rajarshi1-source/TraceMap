@@ -1,0 +1,41 @@
+name: deploy_correlated
+family: deploy
+description: >
+  A release is recorded, and 30 seconds later payment-svc gets 150ms slower.
+  The detector must find the edge AND name the release.
+
+  This case scores harder than the others on purpose: detecting the edge alone
+  is not a pass. An alert that says "payment-svc is slow" sends someone to a
+  dashboard; an alert that says "payment-svc is slow, and it was deployed
+  ninety seconds ago" sends them to a diff. The second one is the product.
+
+  M21 still binds: the alert says "likely cause" with a number, never
+  "caused by". Thirty seconds of proximity is correlation, and the copy has to
+  say so even when it is almost certainly right.
+deploy:
+  service: payment-svc
+  revision: "eval-011"
+  trigger: rollout
+  # Fire the marker this many seconds BEFORE injecting, so the fault lands
+  # inside the correlation window rather than on top of the marker.
+  before_fault_s: 30
+injector:
+  type: latency
+  target: payment-svc
+  endpoint: /charge
+  delay_ms: 150
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  # Detecting the edge without correlating the release scores as a false
+  # negative, not a pass. The case exists to measure the correlation.
+  correlated_deploy:
+    service: payment-svc
+    revision: "eval-011"
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

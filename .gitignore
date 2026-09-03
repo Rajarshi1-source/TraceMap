@@ -32,7 +32,14 @@ dist/
 /data/
 *.log
 result.json
+k6-summary.json
+
+# Eval run artifacts. The RUN is transient; the BASELINE is committed --
+# eval/baselines/main.json is what the merge gate compares against, and a
+# baseline that is not in git is a gate that cannot be reviewed.
 eval-report.md
+eval-run.json
+!eval/baselines/*.json
 
 # --- os ----------------------------------------------------------------------
 .DS_Store

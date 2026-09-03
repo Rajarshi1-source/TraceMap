@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.eval_metrics import router as eval_router
 from src.api.routes import router
 from src.cache.redis_cache import Cache
 from src.core.query_engine import QueryEngine
@@ -53,3 +54,8 @@ app.add_middleware(
 )
 
 app.include_router(router)
+# The eval scoreboard and /metrics. Kept in its own module because it is
+# the only part of the API that reads the harness's tables rather than the
+# telemetry ones -- a different system of record, and worth keeping visibly
+# separate from the graph endpoints.
+app.include_router(eval_router)

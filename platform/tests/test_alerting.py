@@ -8,6 +8,7 @@ it also costs the illusion of coverage.
 
 from __future__ import annotations
 
+import itertools
 import json
 
 from src.core.alert_manager import build_blocks
@@ -48,8 +49,8 @@ def test_alert_leads_with_critical_path_not_wall_clock():
 
     assert "Critical-path p99" in fields[0]
     assert "Wall-clock p99" in fields[1]
-    assert fields.index([f for f in fields if "Critical-path" in f][0]) < \
-           fields.index([f for f in fields if "Wall-clock" in f][0])
+    assert fields.index(next(f for f in fields if "Critical-path" in f)) < \
+           fields.index(next(f for f in fields if "Wall-clock" in f))
 
 
 def test_alert_shows_baseline_observed_and_delta():
@@ -115,7 +116,7 @@ def test_confidence_decays_with_lag():
     assert confidence(CORRELATION_WINDOW_S) == 0.0
     # monotonic, so the number is explainable
     lags = [0, 60, 300, 600, 899]
-    assert all(confidence(a) > confidence(b) for a, b in zip(lags, lags[1:]))
+    assert all(confidence(a) > confidence(b) for a, b in itertools.pairwise(lags))
 
 
 def test_auto_rollback_is_off_by_default():

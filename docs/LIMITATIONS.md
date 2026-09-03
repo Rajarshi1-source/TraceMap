@@ -130,6 +130,45 @@ cannot start quietly rewriting good data.
 
 ---
 
+## 6. The eval score measures this detector on this application
+
+Added in Phase 7, when the harness that produces the accuracy numbers started
+existing. It is a limitation of the *evidence*, not of the algorithm, and it is
+the one most likely to be over-claimed.
+
+**The problem.** F1, precision and MTTD come from twelve hand-written cases
+against one synthetic five-service topology, driven by one k6 script, on one
+host. That is a held-out set in the sense that the detector was not tuned on
+individual cases — but it is not a sample of anything. It generalises to this
+application and no further.
+
+Three specific ways the number is narrower than it sounds:
+
+- **The topology has one shape.** Every case is a synchronous fan-out from
+  order-svc. Nothing measures the detector on a queue, a batch job, or a
+  service mesh with retries.
+- **The traffic has one mode.** A mild diurnal ramp and a 2x step. No weekly
+  seasonality, no multi-tenant mix, no traffic that is legitimately bimodal
+  for business reasons.
+- **The null case needs a quiet host.** Measured directly: a run on a laptop
+  that was concurrently building images produced a **+1020ms** excursion on
+  `gateway-svc->order-svc` and a false positive with nothing injected. The
+  detector was right — the checkout really was slow. On a contended host the
+  null case measures contention, and the result looks exactly like a precision
+  regression, which invites tuning the detector to fix a problem that is not
+  in it.
+
+**Mitigation.** Every reported score names its tier and its environment. The
+nightly run uses a dedicated CI runner rather than a shared one. The case files
+carry their own invariant tests, so a case that has quietly stopped measuring
+what it claims fails before it produces a number.
+
+**Still open.** A second application. Until one exists, twelve cases against
+one topology is a regression suite that behaves like a held-out set, and the
+honest framing is that rather than "my detector has an F1 of 0.9".
+
+---
+
 ## What this means for the claim
 
 The defensible statement is narrow:
@@ -153,3 +192,4 @@ where it *is* true worth believing.
 | 3 | Missing spans | Orphan-tolerant root; completeness scoring not built |
 | 4 | Clock skew | **Implemented** (2 ms floor); skew not yet measured |
 | 5 | Malformed nesting | **Fixed and tested**, both directions |
+| 6 | Eval scope | Measured; one topology, one traffic mode, quiet-host requirement documented |

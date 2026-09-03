@@ -1,0 +1,21 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      # Grafana 13 can link a metric straight into the trace that produced it.
+      # spanmetrics carries trace_id as an exemplar, which is what turns
+      # "p99 is up" into "here is a trace where it was up" in one click --
+      # the single most useful thing this stack does for a person on call.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686

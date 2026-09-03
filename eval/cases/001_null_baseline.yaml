@@ -1,0 +1,25 @@
+name: null_baseline
+family: "null"
+description: >
+  Ten minutes of healthy traffic and nothing injected. Any alert at all is a
+  false positive.
+
+  This is the case that measures the number everyone else omits. Building a
+  detector that fires is easy; proving it stays quiet is the hard half, and it
+  is the half that decides whether anyone still reads the alerts in month two.
+  M9: this case is never dropped to improve the scoreboard. Removing it would
+  not make the detector better, it would make the measurement dishonest.
+injector:
+  # QUOTED. Bare `null` is None in YAML, so an unquoted type here
+  # silently becomes a missing key and the case stops being a null
+  # case -- while still printing a passing row.
+  type: "null"
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "none"
+  # Not a detection deadline -- an observation window. The detector gets ten
+  # full cycles and roughly ten thousand requests in which to embarrass itself.
+  detect_within_s: 600
+  must_not_alert: ["*"]

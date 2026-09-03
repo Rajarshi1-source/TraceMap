@@ -62,6 +62,21 @@ class DetectorConfig:
     baseline_ttl_s: int = 86_400
     warmup_cycles: int = 5        # don't alert while the baseline is cold
 
+    # Error rate gets a FIXED threshold, not an EWMA baseline, and the
+    # asymmetry with latency is deliberate.
+    #
+    # "Normal" latency is genuinely environment-dependent -- 3am differs from
+    # 3pm, a bigger instance differs from a smaller one -- so a baseline that
+    # learns is the right tool and a fixed millisecond threshold is not.
+    # "Normal" error rate is not environment-dependent. Zero is the target.
+    # An EWMA here would mean a service that has been failing 5% of requests
+    # all week reads as healthy, which is the boiling frog again but starting
+    # from a position that was never acceptable.
+    #
+    # 2% against a measured healthy floor of ~0.08% leaves a wide margin, so
+    # this does not fire on the ordinary failures every system has.
+    error_rate_threshold: float = 0.02
+
 
 @dataclass(frozen=True)
 class EdgeObservation:
@@ -106,6 +121,13 @@ class AnomalyDetector:
     def _k_warm(self, s: str, t: str) -> str:  return f"baseline:warmup:{s}:{t}"
     def _k_hist(self, s: str, t: str) -> str:  return f"anomaly:hist:{s}:{t}"
     def _k_dedup(self, s: str, t: str) -> str: return f"anomaly:dedup:{s}:{t}"
+
+    # The error path gets its OWN history and dedup keys. Sharing them with
+    # latency would mean a firing latency alert suppresses a genuine error
+    # alert on the same edge for ten minutes -- two different failures, one of
+    # which silently never reaches anyone.
+    def _k_hist_err(self, s: str, t: str) -> str:  return f"anomaly:hist:err:{s}:{t}"
+    def _k_dedup_err(self, s: str, t: str) -> str: return f"anomaly:dedup:err:{s}:{t}"
 
     async def evaluate(self, obs: EdgeObservation) -> Anomaly | None:
         cfg = self.cfg
@@ -204,6 +226,66 @@ class AnomalyDetector:
             request_count=obs.request_count,
             wall_p99_ms=round(obs.wall_p99_ms, 2),
             sustained=n,
+        )
+
+    async def evaluate_error_rate(self, obs: EdgeObservation) -> Anomaly | None:
+        """The error path, which latency percentiles structurally cannot see.
+
+        An injected 5xx returns FASTER than a success -- the handler raises
+        before the database write -- so a detector watching only critical-path
+        p99 is blind to an edge failing half its requests. The eval harness
+        found this by scoring cases 007 and 008 as false negatives against a
+        detector that was working exactly as designed on the metric it had.
+
+        Deliberately kept separate from `evaluate()` rather than folded in as
+        another branch: the latency path is the flagship and is not worth
+        destabilising to save a method. Same floors, same sustained window,
+        same dedup discipline -- different question.
+        """
+        cfg = self.cfg
+        s, t = obs.source, obs.target
+
+        # Same statistical floor. An error rate over four requests is one bad
+        # request wearing a percentage.
+        if obs.request_count < cfg.min_requests:
+            return None
+
+        breached = obs.error_rate > cfg.error_rate_threshold
+        key = self._k_hist_err(s, t)
+        prev = await self.redis.get(key) or ""
+        hist = (prev + ("1" if breached else "0"))[-cfg.sustained_window:]
+        await self.redis.set(key, hist, ex=cfg.dedup_ttl_s * 2)
+
+        if not breached:
+            return None
+
+        # Same evidence bar as latency: three breaches inside five cycles. A
+        # single bad minute is a deploy or a restart, not a regression.
+        recent = hist.count("1")
+        if recent < cfg.sustained_cycles:
+            log.info("edge %s->%s error breach %d/%d in last %d (%.1f%%)",
+                     s, t, recent, cfg.sustained_cycles, cfg.sustained_window,
+                     obs.error_rate * 100)
+            return None
+
+        won = await self.redis.set(self._k_dedup_err(s, t), "1",
+                                   nx=True, ex=cfg.dedup_ttl_s)
+        if not won:
+            return None
+
+        # baseline/observed/delta carry RATES here, not milliseconds. `metric`
+        # is what tells a reader which, and the alert copy renders it as a
+        # percentage so nobody reads 0.1 as a tenth of a millisecond.
+        return Anomaly(
+            source=s,
+            target=t,
+            metric="error_rate",
+            baseline_ms=cfg.error_rate_threshold,
+            observed_ms=round(obs.error_rate, 4),
+            delta_ms=round(obs.error_rate - cfg.error_rate_threshold, 4),
+            request_count=obs.request_count,
+            wall_p99_ms=round(obs.wall_p99_ms, 2),
+            sustained=recent,
         )
 
     async def _push_history(self, s: str, t: str, breached: bool,

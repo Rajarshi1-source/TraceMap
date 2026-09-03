@@ -7,7 +7,7 @@ COMPOSE := docker compose
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev-local)
 export GIT_SHA
 
-.PHONY: help env up down demo seed logs ps smoke test skills skills-check fanout-guard probe-guard clean
+.PHONY: help env up down demo seed logs ps smoke test skills skills-check fanout-guard probe-guard clean \n        eval eval-smoke eval-case eval-up eval-down eval-gate-guard eval-baseline \n        eval-check eval-tests topology-guard \n        helm-guard monitoring
 
 help: ## Show this help
 	@echo ""
@@ -75,7 +75,66 @@ critical-path-guard: ## Phase 4 - the flagship: parallel siblings score 0, payme
 api-guard: ## Phase 5 - assert the graph API contract and latency budget
 	@python scripts/api-guard.py
 
-guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard api-guard ## Run every invariant guard
+guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard api-guard eval-gate-guard ## Run every invariant guard
+
+# ---------------------------------------------------------------- Phase 7
+#
+# The detector is a model, so it gets a held-out set and a merge gate. Read
+# docs/adr/0006-eval-gates-ci.md before changing a threshold: tuning without
+# re-running the set is M8, and it is the one thing that would collapse the
+# whole MLOps claim.
+
+eval-up: env ## Boot the stack with background load, ready for an eval run
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.eval.yml --profile eval up -d --wait
+	@echo ""
+	@echo "  Warming baselines. Five detector cycles plus pipeline lag - give it"
+	@echo "  ~6 minutes, or every case will score as a false negative because the"
+	@echo "  warmup gate suppressed it (harness failure mode #1)."
+	@echo ""
+
+eval-down: ## Tear the eval stack down, volumes included
+	$(COMPOSE) -f docker-compose.yml -f docker-compose.eval.yml --profile eval down -v
+
+# The overlay publishes the datastores on non-default host ports so a native
+# Postgres or Redis on the machine cannot shadow the containers. These exports
+# point the runner at them.
+EVAL_ENV := POSTGRES_HOST=localhost POSTGRES_PORT=$${EVAL_POSTGRES_PORT:-55432}             REDIS_URL=redis://localhost:$${EVAL_REDIS_PORT:-56379}/0
+
+eval: ## Run the full golden set and print the scoreboard (~110 min)
+	@$(EVAL_ENV) python -m eval.runner --tier full --git-sha $(GIT_SHA) 	  --output eval-report.md --json eval-run.json
+
+eval-smoke: ## Run the 4-case smoke tier (~45 min) - what PRs gate on
+	@$(EVAL_ENV) python -m eval.runner --tier smoke --git-sha $(GIT_SHA) 	  --output eval-report.md --json eval-run.json
+
+eval-case: ## Run one case:  make eval-case CASE=006
+	@$(EVAL_ENV) python -m eval.runner --case $(CASE) --git-sha $(GIT_SHA)
+
+eval-check: ## Compare the last run against its tier's committed baseline
+	@python -m eval.check_regression --current eval-run.json
+
+eval-baseline: ## Record the last run AS its tier's baseline - only ever on main
+	@python -m eval.check_regression --current eval-run.json --update
+	@echo "  Commit this with a message saying WHY the baseline moved."
+
+eval-gate-guard: ## Exit criterion 5 - prove the gate goes red on a broken detector
+	@python scripts/eval-gate-guard.py
+
+eval-tests: ## Fast offline checks: the case files, the scorer, the gate
+	@python -m pytest eval/tests -q -c eval/pytest.ini --rootdir=.
+
+topology-guard: ## Assert the declared service graph still matches the live one
+	@python scripts/topology-guard.py
+
+helm-guard: ## M17/M20/M23/M24 asserted against the rendered chart
+	@helm template tracemap charts/tracemap > /tmp/tracemap-rendered.yaml
+	@python scripts/helm-guard.py --manifest /tmp/tracemap-rendered.yaml
+
+monitoring: env ## Boot core + Prometheus and Grafana (the `full` profile)
+	$(COMPOSE) --profile full up -d --wait
+	@echo ""
+	@echo "  Grafana     http://localhost:3003  (admin / $$GRAFANA_PASSWORD)"
+	@echo "  Prometheus  http://localhost:9090"
+	@echo ""
 
 skills: ## Rebuild .claude/skills/*.skill from skills/ (D4 - archives are artifacts)
 	@python scripts/build-skills.py

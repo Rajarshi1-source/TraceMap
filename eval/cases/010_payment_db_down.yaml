@@ -1,0 +1,32 @@
+name: payment_db_down
+family: dep_kill
+description: >
+  payment-svc loses its database. Charges hang for the connect timeout and then
+  answer 503, which is what a dead dependency actually looks like from one hop
+  up: latency AND errors together, on the same edge, at the same moment.
+
+  The fault is severed at payment-svc's client boundary rather than by stopping
+  the Postgres container, because Postgres is shared with order-svc and
+  user-svc -- stopping it would inject four faults at once and make attribution
+  meaningless. That is the same reason the runner refuses to run cases
+  concurrently. Under Helm this case uses a real NetworkPolicy; see
+  charts/tracemap/templates/networkpolicy.yaml.
+
+  Readiness fails while liveness passes, by design (M17). A dependency outage
+  must take the pod out of rotation, never restart it -- restarting every
+  replica because a database is slow is how a degradation becomes an outage.
+injector:
+  type: dep_kill
+  target: payment-svc
+  endpoint: /charge
+  dep_timeout_ms: 250
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

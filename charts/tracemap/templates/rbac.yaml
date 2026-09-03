@@ -1,0 +1,110 @@
+{{/*
+RBAC for the deploy watcher, and nothing else.
+
+Scope is the entire point here. The watcher's job is to notice that a
+Deployment's revision changed and write a marker so an anomaly can name the
+release. That is a READ. It never needs to create, update, patch or delete
+anything, and it never needs to see a Secret.
+
+A Role, not a ClusterRole: the watcher only cares about its own namespace.
+Reaching for cluster scope "so it keeps working if we move things" is how a
+component that reads Deployment metadata ends up able to read every Secret in
+the cluster.
+
+This matters more than usual because of what sits next to it. M20 keeps
+auto-rollback behind a flag defaulting off; if that flag is ever turned on,
+the permission to actually mutate a Deployment has to be granted explicitly
+and separately, in a commit that says so. It is not granted here.
+*/}}
+{{- if .Values.workers.deployWatcher.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "tracemap.fullname" . }}-deploy-watcher
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+# The watcher talks to the API server with its projected token; it has no
+# reason to mount a token for anything else, and turning this off shrinks the
+# blast radius of a compromised sidecar to nothing.
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "tracemap.fullname" . }}-deploy-watcher
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # get, list, watch. Nothing that writes.
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # Read-only, and only to resolve which ReplicaSet a revision belongs to --
+    # `deployment.kubernetes.io/revision` alone cannot distinguish a rollout
+    # from a scale event, and recording a replica change as a release would be
+    # a false lead that looks authoritative.
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tracemap.fullname" . }}-deploy-watcher
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tracemap.fullname" . }}-deploy-watcher
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tracemap.fullname" . }}-deploy-watcher
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.workers.anomalyDetector.autoRollback.enabled }}
+---
+{{/*
+Only rendered when auto-rollback is deliberately enabled, so the write
+permission cannot exist by default.
+
+If you are reading this in a rendered manifest, someone turned M20's flag on.
+The confidence floor, the per-service rate limit, the kill switch and the
+audit trail in `rollback_audit` are the other four things that must be true
+before this is safe. A rollback triggered by a correlation signal with none of
+them turns one bad deploy into a rollback loop, and the loop looks exactly
+like the system working.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "tracemap.fullname" . }}-rollback
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    tracemap.io/danger: >-
+      Grants Deployment mutation to automated remediation. Requires M20's
+      confidence floor, rate limit, kill switch and audit trail.
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/rollback"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tracemap.fullname" . }}-rollback
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tracemap.fullname" . }}-rollback
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tracemap.fullname" . }}-deploy-watcher
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

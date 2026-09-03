@@ -1,0 +1,138 @@
+{
+  "uid": "tracemap-platform",
+  "title": "TraceMap - Platform self-monitoring",
+  "description": "The observability stack watching itself. Every panel here answers a question the application dashboards structurally cannot: a pipeline that is up, answering, and quietly losing data looks identical to a healthy one from the golden-signals view, because the evidence of the loss is the thing that was lost.",
+  "tags": ["tracemap", "sre", "self-monitoring"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Ingestion - accepted, refused, dropped",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Span ingest completeness",
+      "description": "SLI target >= 99.9% stored. Dropped spans are silent blind spots: nothing errors, the dashboards render, and the traces that survive look normal.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit", "decimals": 4, "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.99 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "job:span_ingest_completeness:5m", "legendFormat": "stored" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Collector span flow",
+      "description": "Accepted vs refused vs dropped. Refused means back-pressure reached the client, which at least the client knows about. Dropped means the collector threw them away silently, which nobody knows about.",
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 1 },
+      "targets": [
+        { "expr": "sum(rate(otelcol_receiver_accepted_spans_total[5m]))", "legendFormat": "accepted" },
+        { "expr": "sum(rate(otelcol_receiver_refused_spans_total[5m]))", "legendFormat": "refused" },
+        { "expr": "sum(rate(otelcol_processor_dropped_spans_total[5m]))", "legendFormat": "dropped" },
+        { "expr": "sum(rate(otelcol_exporter_send_failed_spans_total[5m]))", "legendFormat": "export failed" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Exporter queue depth",
+      "description": "M15: the file_storage persistent queue is what survives a ClickHouse blip. A queue that fills means the blip is outlasting the buffer, and the spans about to be lost are the ones from the incident.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        { "expr": "otelcol_exporter_queue_size", "legendFormat": "{{exporter}} size" },
+        { "expr": "otelcol_exporter_queue_capacity", "legendFormat": "{{exporter}} capacity" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tail sampling decisions",
+      "description": "M14: the probabilistic baseline policy is what stops storage holding only errors and slow traces. Without it every percentile downstream is computed over a sample biased toward the pathological.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        { "expr": "sum by (policy) (rate(otelcol_processor_tail_sampling_count_traces_sampled[5m]))", "legendFormat": "{{policy}}" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Workers - the heartbeat, and what it cannot see",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker cycles",
+      "description": "One series per worker. A flat line at zero is the alert - absent_over_time fires on the ABSENCE of a heartbeat, which is the only way to catch a worker that stopped without crashing. A threshold rule on the value cannot: if the worker is gone, the metric stops being reported and the rule evaluates to nothing.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 13 },
+      "targets": [{
+        "expr": "rate(tracemap_worker_cycle_total[5m]) * 60",
+        "legendFormat": "{{worker}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker cycle failures",
+      "description": "run_forever() keeps the loop alive through exceptions by design, so a worker failing every cycle looks perfectly healthy from the heartbeat. This is what makes that visible.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 13 },
+      "targets": [{
+        "expr": "rate(tracemap_worker_cycle_failures_total[10m]) * 60",
+        "legendFormat": "{{worker}}"
+      }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Assembler lag - span time to roll-up",
+      "description": "NOT YET INSTRUMENTED - tracemap_assembler_lag_seconds has no emitter, so this panel is empty by design rather than by accident. Measured out-of-band at 54s in Phase 6, and it is the single largest term in the detection budget after the sustained window: every second here is a second added to MTTD that no amount of detector tuning can recover. Wiring it is Phase 8 work.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{ "expr": "tracemap_assembler_lag_seconds", "legendFormat": "lag" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "MV vs reconciler divergence",
+      "description": "Guards the materialized-view bug class from ADR 0003. If the incremental fast path is ever wrong again, it arrives here as a number rather than as a surprise mid-demo. Alert fires above 2% for 10 minutes. NOTE: tracemap_edges_mv_total and _recon_total are declared by the Phase 6 rules and not yet emitted - the rule and this panel are both waiting on the reconciler exporter.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "targets": [{
+        "expr": "abs(tracemap_edges_mv_total - tracemap_edges_recon_total) / clamp_min(tracemap_edges_recon_total, 1)",
+        "legendFormat": "divergence"
+      }]
+    },
+    {
+      "type": "row",
+      "title": "Storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 }
+    },
+    {
+      "type": "timeseries",
+      "title": "ClickHouse insert rate and part count",
+      "description": "Part count is the one to watch. Many small inserts create many small parts, merges fall behind, and queries slow down long before anything reports an error - a performance cliff that looks like a query problem and is an ingest problem.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 26 },
+      "targets": [
+        { "expr": "rate(ClickHouseProfileEvents_InsertedRows[5m])", "legendFormat": "rows/s" },
+        { "expr": "ClickHouseMetrics_PartsActive", "legendFormat": "active parts" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Trace store growth",
+      "description": "Feeds the cost model: bytes on disk over rows gives bytes per span, and bytes per span times span rate gives the monthly bill. Knowing what observability costs is most of knowing whether it is worth it.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [{
+        "expr": "sum(ClickHouseAsyncMetrics_DiskUsed_default)",
+        "legendFormat": "bytes on disk"
+      }]
+    }
+  ]
+}

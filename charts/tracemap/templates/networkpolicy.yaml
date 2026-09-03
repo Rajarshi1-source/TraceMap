@@ -1,0 +1,299 @@
+{{/*
+Network policy.
+
+Default-deny ingress, then allow exactly the edges the dependency map draws.
+That symmetry is the useful part: the policy and the graph describe the same
+topology, so an edge appearing on the dashboard that has no rule here is
+either a policy gap or a call nobody meant to make -- and both are worth
+knowing about.
+
+Four rules do real work beyond tidiness, and each protects a different kind of
+damage:
+
+  ClickHouse holds every span, including db.statement text. "Anything in the
+  namespace can query the trace store" is a data-exposure finding waiting to
+  be written up.
+
+  Postgres holds order, payment and user rows plus the anomaly and rollback
+  audit trails -- the records that say what the automation did.
+
+  Redis holds the detector's baselines and its alert suppression. This is the
+  quiet one: anything that can write here can blind the detector without
+  breaking anything. Raise a baseline and the edge stops alerting; set a dedup
+  key and the alert never leaves. Neither shows up as an error anywhere.
+
+  The fault control plane (/_internal/fault) is reachable only from inside the
+  namespace. It is how the eval harness makes services slow on demand, which
+  is precisely why it must never be reachable from the ingress.
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-default-deny
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  # Empty selector = every pod in the namespace. Start closed; each rule below
+  # is then a deliberate statement rather than a hopeful one.
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-gateway-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: gateway-svc
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system   # traefik
+        - podSelector: {}
+      ports:
+        - port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-order-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: order-svc
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway-svc
+      ports:
+        - port: 3001
+---
+{{/*
+The fan-out legs. order-svc calls all three concurrently (M1); gateway-svc
+additionally calls product-svc directly on the browse path, which is why
+product's rule has two sources and the other two have one.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.fanout }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" $ }}-{{ $name }}-ingress
+  labels:
+    {{- include "tracemap.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: {{ $name }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: order-svc
+        {{- if eq $name "product-svc" }}
+        # The browse path: gateway-svc -> product-svc, cacheable and
+        # degradable. It is a real edge on the dependency map and needs a real
+        # rule, or the graph shows traffic the policy says is impossible.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: gateway-svc
+        {{- end }}
+      ports:
+        - port: {{ $svc.port }}
+---
+{{- end }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-clickhouse-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    tracemap.io/why: >-
+      ClickHouse holds every span, including db.statement text and HTTP
+      routes. Restricting it to the four components that legitimately query it
+      is the difference between "spans are retained for days" being a
+      retention note and a data-exposure finding.
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: clickhouse
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: otel-collector
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: analytics-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: trace-assembler
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: graph-builder
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: anomaly-detector
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: deploy-watcher
+      ports:
+        - port: 8123
+        - port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-postgres-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    tracemap.io/why: >-
+      Postgres holds order, payment and user rows plus the anomaly and rollback
+      audit trails. Only the four services that own data in it and the platform
+      workers that write history should be able to reach it.
+    tracemap.io/eval: >-
+      This is also the policy eval case 010 (payment_db_down) would toggle in a
+      cluster. Under compose the same fault is injected at payment-svc's client
+      boundary instead, because Postgres is shared -- stopping the container
+      would inject four faults at once and make attribution meaningless.
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: order-svc
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: user-svc
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: payment-svc
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: product-svc
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: analytics-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: anomaly-detector
+      ports:
+        - port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-redis-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+  annotations:
+    tracemap.io/why: >-
+      Redis holds the detector's EWMA baselines and its alert-suppression
+      state. Anything that can write here can blind the detector silently --
+      raise a baseline and the edge stops alerting, set a dedup key and the
+      alert never leaves.
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: anomaly-detector
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: graph-builder
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: analytics-api
+      ports:
+        - port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-analytics-api-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: analytics-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: dashboard
+      ports:
+        - port: {{ .Values.analyticsApi.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-dashboard-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: dashboard
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: {{ .Values.dashboard.port }}
+---
+{{/*
+The deploy control plane, in-namespace only.
+
+POSTing here writes a deploy marker, and deploy markers are what every future
+alert's "likely cause" line is built on. Anyone who can write one can make a
+regression appear to have been caused by a release that never happened. It
+stays off the ingress.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tracemap.fullname" . }}-deploy-watcher-ingress
+  labels:
+    {{- include "tracemap.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: deploy-watcher
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 9103
+        - port: 9100
+{{- end }}

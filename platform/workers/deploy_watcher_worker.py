@@ -60,14 +60,14 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 async def watch_deployments(ch: ClickHouseClient) -> None:
     try:
-        from kubernetes_asyncio import client, config, watch  # noqa: PLC0415
+        from kubernetes_asyncio import client, config, watch
     except ImportError:
         log.info("kubernetes_asyncio not installed; k8s watch disabled")
         return
 
     try:
         config.load_incluster_config()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - outside a cluster this is the normal path
         log.info("not running in-cluster; k8s watch disabled")
         return
 
@@ -111,7 +111,7 @@ async def watch_deployments(ch: ClickHouseClient) -> None:
                         image_sha=image.split("@")[-1] if "@" in image else image,
                         git_sha=git_sha, replicas=replicas, trigger=trigger,
                     )
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("k8s watch stream failed; reconnecting in 5s")
             await asyncio.sleep(5)
 

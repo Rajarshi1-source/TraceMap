@@ -1,0 +1,26 @@
+name: payment_errors_50pct
+family: error
+description: >
+  Half of all charges fail. This is an outage, not a degradation, and if it
+  takes as long to detect as the 10% case then the detector has no sense of
+  severity -- every eval score would be arithmetically fine while the thing
+  people actually care about, "how fast did you tell me the checkout was
+  broken", went unmeasured.
+
+  The saga compensation in order-svc also runs on every failure here, so this
+  case doubles as load on the refund path.
+injector:
+  type: error
+  target: payment-svc
+  endpoint: /charge
+  error_rate: 0.50
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->payment-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->product-svc"
+    - "order-svc->user-svc"

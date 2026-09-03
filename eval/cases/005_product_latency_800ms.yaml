@@ -1,0 +1,33 @@
+name: product_latency_800ms
+family: latency
+description: >
+  +800ms on product-svc, which at a 45ms baseline is normally a parallel
+  sibling with zero blame. At 845ms it overtakes payment and becomes the
+  critical path.
+
+  This is the decoy case run backwards, and it is why the pair matters: case
+  006 proves the detector does not blame a parallel sibling, and this one
+  proves it is not simply hard-wired to blame payment. A detector that always
+  answers "payment" passes 006 for the wrong reason and fails here.
+injector:
+  type: latency
+  target: product-svc
+  endpoint: /stock/check
+  delay_ms: 800
+  duration_s: 600
+load:
+  script: load-testing/normal-checkout-flow.js
+  rps: 20
+expect:
+  edge: "order-svc->product-svc"
+  detect_within_s: 480
+  must_not_alert:
+    - "order-svc->user-svc"
+    # Payment is untouched at 90ms and, once product overtakes it, stops being
+    # on the critical path at all -- its critical p99 FALLS. An alert here
+    # would mean the detector is reading wall clock.
+    - "order-svc->payment-svc"
+    # The fault is scoped to /stock/check, so the browse path through
+    # gateway-svc->product-svc is unaffected. This trap proves endpoint
+    # scoping works; without it a sloppy injector looks identical.
+    - "gateway-svc->product-svc"
