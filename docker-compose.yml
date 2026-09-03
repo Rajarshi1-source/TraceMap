@@ -333,6 +333,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       GIT_SHA: ${GIT_SHA:-dev-local}
       CORS_ORIGINS: http://localhost:3002
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
     ports:
       - "8090:8090"
     depends_on:
@@ -368,6 +373,64 @@ services:
     depends_on:
       clickhouse: { condition: service_healthy }
       redis: { condition: service_healthy }
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
+  anomaly-detector:
+    build: ./platform
+    command: ["python", "-m", "workers.anomaly_detector_worker"]
+    environment:
+      <<: *platform-env
+      METRICS_PORT: 9102
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-tracemap}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-tracemap}
+      DETECT_INTERVAL_S: ${DETECT_INTERVAL_S:-60}
+      DETECTOR_ALPHA: ${DETECTOR_ALPHA:-0.2}
+      DETECTOR_THRESHOLD_MS: ${DETECTOR_THRESHOLD_MS:-50}
+      DETECTOR_MIN_REQUESTS: ${DETECTOR_MIN_REQUESTS:-100}
+      DETECTOR_SUSTAINED_CYCLES: ${DETECTOR_SUSTAINED_CYCLES:-3}
+      DETECTOR_WARMUP_CYCLES: ${DETECTOR_WARMUP_CYCLES:-5}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      JAEGER_BASE: ${JAEGER_BASE:-http://localhost:16686}
+      DASHBOARD_BASE: ${DASHBOARD_BASE:-http://localhost:3002}
+      # M20 - the dangerous feature ships OFF.
+      AUTO_ROLLBACK_ENABLED: ${AUTO_ROLLBACK_ENABLED:-false}
+    ports:
+      - "9102:9102"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9102/metrics',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    profiles: [core, full, eval]
+
+  deploy-watcher:
+    build: ./platform
+    command: ["python", "-m", "workers.deploy_watcher_worker"]
+    environment:
+      <<: *platform-env
+      METRICS_PORT: 9104
+      DEPLOY_CONTROL_PORT: 9103
+    ports:
+      - "9103:9103"     # POST /_internal/deploy - eval case 011 drives this
+      - "9104:9104"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9103/healthz',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     restart: unless-stopped
     profiles: [core, full, eval]
 

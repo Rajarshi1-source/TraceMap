@@ -3,3 +3,5 @@ prometheus-client==0.24.0
 fastapi==0.121.2
 uvicorn[standard]==0.38.0
 redis==6.4.0
+psycopg[binary,pool]==3.2.10
+aiohttp==3.13.2

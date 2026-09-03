@@ -99,6 +99,43 @@ ORDER BY ts
 """
 
 
+# ---------------------------------------------------------------------------
+# Detector view: ONE minute-bucket, not a rolling window.
+#
+# A rolling window is right for the dashboard and wrong for the detector. Over
+# 5 minutes a p99 blends pre-fault and post-fault requests, so an injected step
+# arrives as a RAMP - each cycle's delta lands under the threshold and the EWMA
+# legitimately learns it, until the baseline has chased the fault into place
+# without a single cycle ever breaching. Measured: a 60ms injection never fired.
+#
+# Narrowing the window to 1 minute does not fix it either, and measuring says
+# why: the pipeline lag from trace to roll-up is ~54s, so `now() - 1 MINUTE`
+# excludes the newest bucket entirely and the detector reads nan.
+#
+# A single minute-bucket is HOMOGENEOUS IN TIME - every request in it shares one
+# fault state - so it cannot dilute. Taking the newest bucket that exists gives
+# a clean step response and rides whatever the current lag happens to be,
+# instead of encoding an assumption about it.
+Q_LATEST_BUCKET = """
+SELECT
+    source_service AS source,
+    target_service AS target,
+    toString(time_bucket)                       AS bucket,
+    sum(request_count)                          AS requests,
+    sum(error_count)                            AS errors,
+    sum(error_count) / nullIf(sum(request_count), 0) AS error_rate,
+    quantileTDigestMerge(0.99)(wall_p99_state)  AS wall_p99,
+    quantileTDigestMerge(0.99)(crit_p99_state)  AS crit_p99
+FROM tracemap.service_edges_1m
+WHERE time_bucket = (
+    SELECT max(time_bucket) FROM tracemap.service_edges_1m
+    WHERE time_bucket >= now() - INTERVAL 15 MINUTE
+)
+GROUP BY source, target, time_bucket
+HAVING requests > 0
+"""
+
+
 def _f(v, default: float = 0.0) -> float:
     return default if v is None else float(v)
 
@@ -145,6 +182,22 @@ class QueryEngine:
             for n in sorted(names)
         ]
         return {"nodes": nodes, "edges": edges}
+
+    async def latest_bucket_edges(self) -> list[dict]:
+        """Per-edge metrics for the newest minute-bucket. Detector input."""
+        rows = await self.ch.query(Q_LATEST_BUCKET)
+        return [
+            {
+                "source": r["source"],
+                "target": r["target"],
+                "bucket": r["bucket"],
+                "requestCount": int(r["requests"]),
+                "errorRate": round(_f(r.get("error_rate")), 4),
+                "wallP99": round(_f(r.get("wall_p99")), 2),
+                "critP99": round(_f(r.get("crit_p99")), 2),
+            }
+            for r in rows
+        ]
 
     async def blame(self, window_min: int = 5) -> list[dict]:
         rows = await self.ch.query(Q_BLAME, {"window": window_min})

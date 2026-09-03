@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -44,6 +45,89 @@ async def get_edge(request: Request, src: str, dst: str, window: int = 60):
     if not series and not traces:
         raise HTTPException(status_code=404, detail="edge_not_found")
     return {"source": src, "target": dst, "series": series, "slowTraces": traces}
+
+
+@router.get("/api/anomalies")
+async def get_anomalies(request: Request, limit: int = 50):
+    """Anomaly history from Postgres.
+
+    Every row carries `correlated_deploy`, including the {"found": false} case -
+    "no deploy correlated" is a real result that points the investigation away
+    from the changelog, and omitting it would make the record ambiguous.
+    """
+    pg = getattr(request.app.state, "pg", None)
+    if pg is None:
+        return {"anomalies": [], "note": "postgres unavailable"}
+    rows = await pg.fetch(
+        """
+        SELECT id, detected_at, src_service, dst_service, metric,
+               baseline_ms, observed_ms, delta_ms, request_count,
+               sample_trace_ids, correlated_deploy, resolved_at
+        FROM anomaly_events
+        ORDER BY detected_at DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    import json as _json
+    return {"anomalies": [
+        {
+            "id": str(r["id"]),
+            "detectedAt": r["detected_at"].isoformat(),
+            "source": r["src_service"],
+            "target": r["dst_service"],
+            "metric": r["metric"],
+            "baselineMs": float(r["baseline_ms"]),
+            "observedMs": float(r["observed_ms"]),
+            "deltaMs": float(r["delta_ms"]),
+            "requestCount": int(r["request_count"]),
+            "sampleTraceIds": list(r["sample_trace_ids"] or []),
+            "deploy": (r["correlated_deploy"] if isinstance(r["correlated_deploy"], dict) else _json.loads(r["correlated_deploy"])) if r["correlated_deploy"] else {"found": False},
+            "resolvedAt": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+        }
+        for r in rows
+    ]}
+
+
+@router.get("/api/deploys")
+async def get_deploys(request: Request, limit: int = 20):
+    rows = await request.app.state.ch.query(
+        "SELECT service_name, revision, git_sha, toString(deployed_at) AS deployed_at,"
+        " trigger FROM tracemap.deploy_markers ORDER BY deployed_at DESC LIMIT {limit}",
+        {"limit": limit},
+    )
+    return {"deploys": rows}
+
+
+@router.get("/api/stream/alerts")
+async def stream_alerts(request: Request):
+    """Server-sent events over a Redis pub/sub channel.
+
+    SSE rather than WebSockets: this is one-directional, it survives proxies
+    that mangle upgrades, and the browser reconnects on its own. A WebSocket
+    would be more machinery for no extra capability.
+    """
+    from src.core.alert_manager import ALERT_CHANNEL
+
+    async def events():
+        pubsub = request.app.state.cache.redis.pubsub()
+        await pubsub.subscribe(ALERT_CHANNEL)
+        try:
+            # Comment frame first: it opens the stream immediately so a proxy
+            # cannot sit on the response waiting for bytes that may be minutes away.
+            yield ": connected\n\n"
+            async for msg in pubsub.listen():
+                if await request.is_disconnected():
+                    break
+                if msg.get("type") == "message":
+                    yield f"data: {msg['data']}\n\n"
+        finally:
+            await pubsub.unsubscribe(ALERT_CHANNEL)
+            await pubsub.aclose()
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @router.get("/healthz")

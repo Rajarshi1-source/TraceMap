@@ -18,6 +18,7 @@ from src.api.routes import router
 from src.cache.redis_cache import Cache
 from src.core.query_engine import QueryEngine
 from src.integrations.clickhouse_client import ClickHouseClient
+from src.integrations.postgres_client import PostgresClient
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -33,7 +34,10 @@ async def lifespan(app: FastAPI):
     app.state.ch = ClickHouseClient()
     app.state.cache = Cache()
     app.state.engine = QueryEngine(app.state.ch)
+    app.state.pg = await PostgresClient.connect()
     yield
+    if app.state.pg is not None:
+        await app.state.pg.close()
     await app.state.ch.close()
     await app.state.cache.close()
 

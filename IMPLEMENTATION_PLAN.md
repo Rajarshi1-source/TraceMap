@@ -26,7 +26,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **3 — ClickHouse tier** | ✅ **Done** | 6/6 verified; 14 objects from an empty server, both storage profiles boot |
 | **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
 | **5 — API + dashboard** | ✅ **Done** | 7/7 verified; toggle fades the parallel edge, positions drift 1.14px across polls |
-| 6 — Detector + deploy attribution | Not started | |
+| **6 — Detector + deploy attribution** | ✅ **Done** | 7/7 verified live; 60ms fault alerted at **375s** — see F19 on the budget |
 | 7 — Eval harness + CI ⭐ | Not started | |
 | 8 — Docs + polish | Not started | |
 
@@ -624,6 +624,77 @@ finished last. That single trace sets the p99 at 47 ms while the mean is 1.8 ms
 against payment's 95.2 ms. The attribution is being honest per-trace rather than
 applying a blanket rule, which is the correct behaviour; it is worth knowing
 before quoting a p99 in a demo.
+
+
+---
+
+## 2g. Found while building (Phase 6)
+
+Four findings, three of them the same bug wearing different clothes: **the
+baseline quietly absorbing the fault**. M6 guards one route in; measuring found
+three more.
+
+### F19 — 🔴 The documented detection budget is optimistic by ~2x
+
+Measured injection-to-alert: **375 seconds**. The build plan says ~180s;
+`eval-harness.md` says ~245s worst case. Both omit the assembler lag and bucket
+completion:
+
+```
+  assembler lag (trace -> roll-up)        ~54s   MEASURED
++ bucket must complete                    ~60s
++ detector notices on its next cycle      ~60s
++ 3 breaches at 60s each                 ~180s
+                                        = ~354s
+```
+
+**Phase 7 must widen `detect_within_s` to ~400s before the harness is trusted.**
+As written, `003_payment_latency_60ms` has `detect_within_s: 180` and would score
+a working detector as a false negative — and the natural response to a red eval
+is to weaken the detector rather than fix the budget.
+
+### F20 — 🔴 A rolling window turns a step fault into a ramp
+
+A p99 over a 5-minute rolling window blends pre- and post-fault requests. Each
+cycle's delta lands under the threshold, the EWMA legitimately learns it, and
+the baseline chases the fault into place **without a single cycle ever
+breaching**. Measured: a 60ms injection never fired in 422s while the baseline
+drifted 113 → 123.6.
+
+A 1-minute rolling window does not fix it — the pipeline lag is ~54s, so
+`now() - INTERVAL 1 MINUTE` excludes the newest bucket and the detector reads
+`nan`. The detector now evaluates **a single minute-bucket**, which is
+homogeneous in time and therefore cannot dilute.
+
+### F21 — 🔴 The baseline armed 28ms high, eating the signal
+
+Seeded from one observation; if that sample is an outlier, `alpha=0.2` cannot
+walk it off in five warmup cycles. Measured: seed on a 146ms outlier against a
+true ~110ms level armed the baseline at **139.5ms**, so a real 65ms fault
+presented as a **40ms delta** — under the 50ms threshold, undetected.
+
+The detector was correct; the baseline was wrong. Fixed with two regimes of the
+same estimator: `warmup_alpha = 0.5` converges fast, `alpha = 0.2` resists noise
+once armed. Baseline now arms within 3ms of truth.
+
+### F22 — 🟡 "Three consecutive" is too brittle for a real percentile
+
+With a correct baseline, a +60ms fault gives ~57ms delta against a 50ms
+threshold, and bucket noise is **±20ms**. A single dip resets a consecutive run:
+the counter reached 2, reset, reached 1, reset, undetected for 472s. Changed to
+**3 breaches within 5 cycles** — same evidence bar, tolerant of real noise.
+
+That opened a subtler hole worth naming: under a noisy sustained fault the
+occasional sub-threshold cycle is *not* a breach, so it teaches the baseline —
+**M6 satisfied to the letter, defeated in practice.** The baseline now moves only
+when the *entire recent window* is clean.
+
+### The M6 guard was proven, not assumed
+
+Applying the exact edit the comment warns against — hoisting `_update_ewma` out
+of the healthy branch — made the baseline chase the fault **100.0 → 367.8**, and
+the guard failed with a legible message. A guard nobody has seen fail is a guard
+nobody should trust.
 
 ---
 

@@ -375,9 +375,9 @@ footer{
   <dl class="metastrip">
     <div><dt>Implementation code found</dt><dd>0 <small>lines</small></dd></div>
     <div><dt>Algorithm tests run</dt><dd>6 / 6 <small>pass</small></dd></div>
-    <div><dt>Defects found</dt><dd>18 <small>all verified &amp; fixed</small></dd></div>
+    <div><dt>Defects found</dt><dd>22 <small>all verified &amp; fixed</small></dd></div>
     <div><dt>Binding mandates</dt><dd>30</dd></div>
-    <div><dt>Phases shipped</dt><dd>6 / 9 <small>0-5 verified</small></dd></div>
+    <div><dt>Phases shipped</dt><dd>7 / 9 <small>0-6 verified</small></dd></div>
   </dl>
 
   <div class="tw" style="margin-top:26px">
@@ -390,8 +390,8 @@ footer{
         <tr><td><strong>3 — ClickHouse tier</strong></td><td><span class="pill ok">Done</span></td><td>6 / 6 verified; 14 objects from an empty server, both storage profiles boot</td></tr>
         <tr><td><strong>4 — Critical path ⭐</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified live; product-svc 47ms wall clock, <strong>0ms blame</strong></td></tr>
         <tr><td><strong>5 — API + dashboard</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified; the toggle fades the parallel edge, positions drift 1.14px across polls</td></tr>
-        <tr><td>6 — Detector + deploy attribution</td><td><span class="pill acc">Next</span></td><td></td></tr>
-        <tr><td>7 — Eval harness + CI ⭐</td><td>Not started</td><td></td></tr>
+        <tr><td><strong>6 — Detector + deploy attribution</strong></td><td><span class="pill ok">Done</span></td><td>7 / 7 verified live; 60ms fault alerted at <strong>375s</strong> — see F19</td></tr>
+        <tr><td>7 — Eval harness + CI ⭐</td><td><span class="pill acc">Next</span></td><td>must widen detect_within_s to ~400s first (F19)</td></tr>
         <tr><td>8 — Docs + polish</td><td>Not started</td><td></td></tr>
       </tbody>
     </table>
@@ -615,6 +615,42 @@ product-svc | SPAN_KIND_SERVER | GET /products  = <span class="bad">0</span></co
   <h3><span class="pill warn">F9</span> &nbsp;.env pinned a stale GIT_SHA</h3>
   <p><code>make env</code> refused to touch an existing <code>.env</code>, so <code>GIT_SHA</code> stayed at whatever HEAD was when the file was created — two commits later every span still carried the old SHA. Caught only because the trace guard compares <code>service.version</code> against <code>git rev-parse</code>.</p>
   <p><strong>A stale <code>service.version</code> is worse than a missing one:</strong> Phase 6 deploy attribution would confidently name the wrong commit, and the alert would look authoritative while pointing at an innocent change.</p>
+
+  <h3 style="margin-top:38px">Found while building — Phase 6</h3>
+  <p>Four findings, three of them the same bug wearing different clothes: <strong>the baseline quietly absorbing the fault</strong>. M6 guards one route in; measuring found three more.</p>
+
+  <h3><span class="pill crit">F19</span> &nbsp;The documented detection budget is optimistic by ~2×</h3>
+  <p>Measured injection-to-alert: <strong>375 seconds</strong>. The plan says ~180s; <code>eval-harness.md</code> says ~245s worst case. Both omit the assembler lag and bucket completion:</p>
+  <pre><code>  assembler lag (trace -> roll-up)        ~54s   <span class="c">MEASURED</span>
++ bucket must complete                    ~60s
++ detector notices on its next cycle      ~60s
++ 3 breaches at 60s each                 ~180s
+                                        = ~354s</code></pre>
+  <p><strong>Phase 7 must widen <code>detect_within_s</code> to ~400s before the harness is trusted.</strong> As written, case 003 would score a working detector as a false negative — and the natural response to a red eval is to weaken the detector rather than fix the budget.</p>
+
+  <h3><span class="pill crit">F20</span> &nbsp;A rolling window turns a step fault into a ramp</h3>
+  <p>A p99 over 5 minutes blends pre- and post-fault requests. Each cycle's delta lands under the threshold, the EWMA legitimately learns it, and the baseline chases the fault into place <strong>without a single cycle ever breaching</strong>. Measured: a 60ms injection never fired in 422s while the baseline drifted 113 → 123.6.</p>
+  <div class="tw"><table>
+    <thead><tr><th></th><th class="mono">pre</th><th class="mono">+46s</th><th class="mono">+91s</th><th class="mono">+136s</th><th class="mono">+408s</th></tr></thead>
+    <tbody>
+      <tr><td>single bucket</td><td class="mono">169.5</td><td class="mono">113.9</td><td class="mono"><strong>173.5</strong></td><td class="mono"><strong>198.4</strong></td><td class="mono">202.6</td></tr>
+      <tr><td>rolling 5-min</td><td class="mono">124.4</td><td class="mono">120.9</td><td class="mono">167.9</td><td class="mono">176.3</td><td class="mono"><strong>206.4 still climbing</strong></td></tr>
+    </tbody>
+  </table></div>
+  <p>A 1-minute window does not fix it either: the pipeline lag is ~54s, so <code>now() - INTERVAL 1 MINUTE</code> excludes the newest bucket and the detector reads <code>nan</code>. It now evaluates a <strong>single minute-bucket</strong> — homogeneous in time, so it cannot dilute.</p>
+
+  <h3><span class="pill crit">F21</span> &nbsp;The baseline armed 28 ms high, eating the signal</h3>
+  <p>Seeded from one observation; if that sample is an outlier, <code>alpha=0.2</code> cannot walk it off in five warmup cycles. Measured: a seed on a 146ms outlier against a true ~110ms level armed the baseline at <strong>139.5ms</strong>, so a real 65ms fault presented as a <strong>40ms delta</strong> — under the 50ms threshold, undetected.</p>
+  <p><strong>The detector was correct; the baseline was wrong.</strong> No threshold tuning fixes a mis-estimated baseline, and lowering the threshold would trade a missed detection for a permanent false-positive rate. Fixed with two regimes of the same estimator — <code>warmup_alpha=0.5</code> to converge, <code>alpha=0.2</code> to resist noise. Baseline now arms within 3ms of truth.</p>
+
+  <h3><span class="pill warn">F22</span> &nbsp;"Three consecutive" is too brittle for a real percentile</h3>
+  <p>With a correct baseline a +60ms fault gives ~57ms delta against a 50ms threshold, and bucket noise is <strong>±20ms</strong>. A single dip resets a consecutive run: the counter reached 2, reset, reached 1, reset, undetected for 472s. Changed to <strong>3 breaches within 5 cycles</strong>.</p>
+  <p>That opened a subtler hole worth naming: under a noisy sustained fault the occasional sub-threshold cycle is <em>not</em> a breach, so it teaches the baseline — <strong>M6 satisfied to the letter, defeated in practice</strong>. The baseline now moves only when the <em>entire recent window</em> is clean.</p>
+
+  <div class="callout">
+    <span class="tag">The M6 guard was proven, not assumed</span>
+    <p>Applying the exact edit its comment warns against — hoisting <code>_update_ewma</code> out of the healthy branch — made the baseline chase the fault <strong>100.0 → 367.8</strong>, and the guard failed with a legible message. A guard nobody has seen fail is a guard nobody should trust.</p>
+  </div>
 
   <h3 style="margin-top:38px">Found while building — Phase 5</h3>
 
