@@ -13,11 +13,30 @@ router = APIRouter()
 
 @router.get("/api/graph")
 async def get_graph(request: Request, window: int = 5):
-    """The dependency map. Served from Redis; falls back to a live query.
+    """The dependency map. Three sources, tried in order, and none of them lie.
 
-    The cached path is the normal one and is a sub-2ms hit. The fallback exists
-    so a cold start still renders instead of showing an empty canvas while the
-    builder waits out its first interval.
+        cache      graph:current, under 60s old. The normal path, sub-2ms.
+        live       a direct query. Covers a cold start, before the builder's
+                   first interval has elapsed.
+        last-good  graph:lastgood, up to an hour old, flagged degraded.
+
+    F40, and the ordering is a measured correction rather than a design
+    flourish. Chaos experiment 001 killed ClickHouse under live load; this
+    endpoint served honest stale data for thirty seconds and then returned HTTP
+    500 for the remaining hundred seconds of the outage, because `graph:current`
+    had expired and the live fallback had nothing to talk to. The staleness
+    banner is the feature that exists so degraded data beats no data (M26), and
+    it could not survive the one scenario it was built for.
+
+    Last-good is returned with HTTP 200, deliberately. M26 says never display
+    stale data WITHOUT the banner -- not never display it. A 503 here would be
+    more literal and less useful: the dashboard would render nothing, and an
+    operator mid-incident would lose the last known shape of their system at
+    the moment they most want it. So: 200, `stale: true`, `degraded: true`, and
+    the real age in seconds.
+
+    503 is reserved for having genuinely nothing -- no cache, no database, no
+    last-good -- and it says which of the three failed.
     """
     cache = request.app.state.cache
     graph = await cache.get_graph()
@@ -25,8 +44,28 @@ async def get_graph(request: Request, window: int = 5):
         graph["source"] = "cache"
         return graph
 
-    engine = request.app.state.engine
-    graph = await engine.graph(window)
+    try:
+        graph = await request.app.state.engine.graph(window)
+    except Exception as exc:
+        # Deliberately broad: every way ClickHouse can be unreachable has the
+        # same answer here, which is to fall back rather than 500. Enumerating
+        # httpx's error tree would arrive at this same handler by a longer road.
+        # (No BLE001 suppression needed -- `exc` is re-raised on the 503 path,
+        # so ruff does not treat this as a blind catch.)
+        log.warning("live graph query failed, falling back to last-good: %s", exc)
+        graph = await cache.get_last_good()
+        if graph is None:
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "no_graph_available",
+                        "cache": "expired", "live": exc.__class__.__name__,
+                        "lastGood": "absent",
+                        "note": "analytics tier is down and nothing was cached "
+                                "within the last hour"},
+            ) from exc
+        graph["source"] = "last-good"
+        return graph
+
     graph.update({"computedAt": None, "ageSeconds": 0.0,
                   "stale": False, "source": "live"})
     return graph

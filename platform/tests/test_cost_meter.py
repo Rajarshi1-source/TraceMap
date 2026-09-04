@@ -80,30 +80,77 @@ def test_an_empty_table_reports_no_bytes_per_row_rather_than_dividing_by_zero():
 # Projection -- the modelling decision worth a test
 # ---------------------------------------------------------------------------
 
-def test_rollups_are_projected_from_their_own_size_not_the_span_rate():
-    """`service_edges_1m` is bounded by topology, not by traffic.
+def test_each_table_is_projected_from_its_own_growth():
+    """current_bytes x retention / observed_age, per table, no taxonomy.
 
-    Both tables below carry the same bytes-per-row. If the roll-up were
-    projected off spans-per-day it would come out the same size as the raw span
-    table scaled to 30 days -- roughly 30x the raw 7-day figure -- and the model
-    would recommend dropping the cheapest, most useful table in the schema.
+    The fixture gives four hours of history (0.1667 days), so a 7-day table
+    scales by 42x and a 30-day table by 180x. Same input bytes, different TTL,
+    proportionally different projection -- and no rule anywhere that has to
+    know what kind of table it is looking at.
     """
     r = report([
         part("spans", rows=1_000_000, bytes_on_disk=180_000_000),
         part("service_edges_1m", rows=1_000_000, bytes_on_disk=180_000_000),
     ])
     proj = {t["table"]: t for t in r["projected"]["tables"]}
+    current_gib = 180_000_000 / GIB
+    age_days = 4.0 / 24.0
 
-    # The roll-up projects to exactly what it currently occupies.
-    # rel rather than exact: projectedGiB is rounded to 4dp for display.
+    assert proj["spans"]["projectedGiB"] == pytest.approx(
+        current_gib * 7 / age_days, rel=1e-3)
     assert proj["service_edges_1m"]["projectedGiB"] == pytest.approx(
-        180_000_000 / GIB, rel=1e-3)
-    assert "topology" in proj["service_edges_1m"]["basis"]
+        current_gib * 30 / age_days, rel=1e-3)
 
-    # The raw table projects off the ingest rate: 36k/h -> 864k/day, 7 days.
-    expected = 180.0 * 864_000 * 7 / GIB
-    assert proj["spans"]["projectedGiB"] == pytest.approx(expected, rel=1e-3)
-    assert "spans/day" in proj["spans"]["basis"]
+
+def test_an_event_driven_table_is_not_billed_as_span_traffic():
+    """The regression test for the bug that running this thing exposed.
+
+    `deploy_markers` is a row per release with 90-day retention. The first
+    version of this model classified tables by name -- anything not ending
+    `_1m` or `_recon` was projected as bytes/row x SPANS/day x retention --
+    and produced 3,477 GiB for a table holding a few kilobytes, turning a
+    EUR 7.05 bill into EUR 191.
+
+    Ninety days of a table that gains a row per deploy must stay small no
+    matter how many spans are flowing past it.
+    """
+    r = report([
+        part("spans", rows=5_000_000, bytes_on_disk=280_000_000),
+        part("deploy_markers", rows=40, bytes_on_disk=8_000),
+    ], rows_last_hour=1_700_000)          # a very high span rate
+    proj = {t["table"]: t for t in r["projected"]["tables"]}
+
+    # 8 KB over 4 hours, at 90 days: about 4.3 MB. Not 3.4 TB.
+    assert proj["deploy_markers"]["projectedGiB"] < 0.01, (
+        "deploy_markers is being scaled by span volume again")
+    assert proj["deploy_markers"]["projectedGiB"] < proj["spans"]["projectedGiB"]
+
+
+def test_a_table_older_than_its_own_ttl_projects_to_its_current_size():
+    """Past the horizon there is nothing left to project: it IS steady state."""
+    # 200 hours of history against otel_spans' 1-day retention.
+    r = report([part("otel_spans", rows=1_000_000, bytes_on_disk=90_000_000)],
+               oldest="2026-08-27 04:00:00", newest="2026-09-04 12:00:00")
+    row = r["projected"]["tables"][0]
+
+    assert row["projectedGiB"] == pytest.approx(90_000_000 / GIB, rel=1e-3)
+    assert "past its own TTL" in row["basis"]
+
+
+def test_a_recent_traffic_ramp_is_named_in_the_caveat():
+    """The known weakness of scaling from a lifetime average, stated aloud.
+
+    Measured on this repository: a lifetime average of ~4.5M spans/day against
+    a last-hour rate of 41.5M/day, because the eval overlay's load generator
+    had recently started. The projection is then ~9x low, and a reader has no
+    way to see that from the numbers alone.
+    """
+    # 1M rows over 4h is 6M/day lifetime; 3M/h is 72M/day current -- 12x.
+    r = report([part("spans", rows=1_000_000, bytes_on_disk=180_000_000)],
+               rows_last_hour=3_000_000)
+
+    assert r["measured"]["rateRatio"] > 2.0
+    assert "UNDERSTATES" in r["caveat"]
 
 
 def test_a_table_with_no_declared_retention_is_skipped_not_guessed():
@@ -140,9 +187,8 @@ def test_at_demo_scale_the_bill_is_the_box():
 
 def test_overflow_is_charged_only_beyond_what_the_box_includes():
     """Charging for the first 80GB twice is the easiest way to be wrong."""
-    # 200 bytes/row at a rate that projects well past 80GB.
-    r = report([part("spans", rows=1_000_000, bytes_on_disk=200_000_000)],
-               rows_last_hour=40_000_000)
+    # 3 GiB accumulated in four hours, at a 7-day TTL: a 42x scale, well past 80.
+    r = report([part("spans", rows=20_000_000, bytes_on_disk=3 * 1024**3)])
     c = r["cost"]
 
     projected = r["projected"]["totalGiB"]

@@ -154,7 +154,7 @@ class CostMeter:
         # and a cost claim.
         age_h = self._age_hours(ingest)
 
-        projected = self._project(tables, spans_per_day)
+        projected = self._project(tables, age_h)
         overflow_gb = max(0.0, projected["totalGiB"] - HOST_DISK_GB)
         volume_eur = overflow_gb * VOLUME_EUR_PER_GB_MONTH
         monthly_eur = HOST_MONTHLY_EUR + volume_eur
@@ -163,11 +163,28 @@ class CostMeter:
         per_million = (monthly_eur / (spans_per_month / 1e6)
                        if spans_per_month > 0 else None)
 
+        # The projection scales each table from its LIFETIME average growth,
+        # while the ingest rate is measured over the LAST HOUR. When those two
+        # disagree sharply the projection is stale in a specific direction, and
+        # the report should say which rather than leave the reader to notice.
+        # Measured on this repository: a lifetime average of ~4.5M spans/day
+        # against a last-hour rate of 41.5M/day, because the eval overlay's
+        # load generator had recently started. A 9x under-projection that looks
+        # like nothing at all in the output.
+        span_rows = next((t["rows"] for t in tables if t["table"] == "spans"), 0)
+        lifetime_per_day = (span_rows / (age_h / 24.0)
+                            if age_h and age_h > 0 else None)
+        rate_ratio = (spans_per_day / lifetime_per_day
+                      if lifetime_per_day else None)
+
         return {
             "measured": {
                 "onDiskGiB": round(on_disk_gib, 4),
                 "spansPerHour": rows_per_hour,
                 "spansPerDay": round(spans_per_day, 1),
+                "spansPerDayLifetimeAvg": (None if lifetime_per_day is None
+                                           else round(lifetime_per_day, 1)),
+                "rateRatio": None if rate_ratio is None else round(rate_ratio, 2),
                 "databaseAgeHours": age_h,
                 "tables": tables,
             },
@@ -193,7 +210,7 @@ class CostMeter:
                 "steadyState": "derived: bytes/row x rows/day x retention",
                 "price": "config, re-check before quoting",
             },
-            "caveat": self._caveat(age_h),
+            "caveat": self._caveat(age_h, rate_ratio),
         }
 
     # -- pieces ------------------------------------------------------------
@@ -230,48 +247,87 @@ class CostMeter:
         except (ValueError, TypeError):
             return None
 
-    def _project(self, tables: list[dict], spans_per_day: float) -> dict:
+    def _project(self, tables: list[dict], age_h: float | None) -> dict:
         """Steady-state disk: what this fills once every TTL horizon is reached.
 
-        Per table rather than in aggregate, because the tables scale on
-        different axes. Raw spans scale with the sample rate; the 1-minute
-        roll-ups scale with the number of distinct edges, which is bounded by
-        the topology and barely moves with traffic at all.
+        Each table is projected from ITS OWN observed accumulation, never from
+        the span rate:
+
+            projected = current_bytes x retention_days / min(age_days, retention)
+
+        Read plainly: this table put down X bytes in N days, so at a TTL of R
+        days it holds X.R/N. Once the table is older than its own retention the
+        factor is 1 and the projection collapses to the current size, which is
+        correct -- it is already at steady state.
+
+        WHY NOT THE SPAN RATE. The first version of this method classified
+        tables by name: anything not ending `_1m` or `_recon` was projected as
+        bytes/row x spans/day x retention. Running it produced `deploy_markers`
+        at 3,477 GiB and a monthly bill of EUR 191, because deploys do not
+        scale with spans -- ninety days of a table that gains a row per release
+        was being billed as ninety days of span traffic. `trace_critical_path`
+        was overstated the same way: one row per trace, projected as though it
+        were one row per span.
+
+        Any model that has to guess which axis a table scales on will be wrong
+        about a table someone adds later. Measuring each table's own growth
+        needs no taxonomy and cannot be wrong about a table it has never seen.
         """
         rows: list[dict] = []
         total = 0.0
+        age_days = None if age_h is None else max(age_h / 24.0, 1e-6)
+
         for t in tables:
             days = t["retentionDays"]
-            bpr = t["bytesPerRow"]
-            if days is None or bpr is None:
+            if days is None:
                 continue
-            # Roll-ups are bounded by (edges x minutes), not by span volume.
-            # Projecting them off the span rate would overstate them by orders
-            # of magnitude, so they are extrapolated from their own observed
-            # rate instead: current bytes, scaled to the retention horizon.
-            if t["table"].endswith("_1m") or t["table"].endswith("_recon"):
-                gib = t["onDiskGiB"]
-                basis = "current size (bounded by topology, not traffic)"
+            current = t["onDiskGiB"]
+            if age_days is None:
+                gib, basis = current, "current size (no history to scale from)"
+            elif age_days >= days:
+                gib, basis = current, "observed: the table is past its own TTL"
             else:
-                gib = bpr * spans_per_day * days / GIB
-                basis = "bytes/row x spans/day x retention"
+                gib = current * days / age_days
+                basis = (f"current size x {days}d retention / "
+                         f"{age_days:.2f}d observed")
             rows.append({"table": t["table"], "retentionDays": days,
                          "projectedGiB": round(gib, 4), "basis": basis})
             total += gib
+
         rows.sort(key=lambda r: r["projectedGiB"], reverse=True)
         return {"totalGiB": round(total, 3), "tables": rows,
-                "diskHeadroomGb": round(HOST_DISK_GB - total, 2)}
+                "diskHeadroomGb": round(HOST_DISK_GB - total, 2),
+                "method": "each table scaled from its own observed growth"}
 
     @staticmethod
-    def _caveat(age_h: float | None) -> str:
+    def _caveat(age_h: float | None, rate_ratio: float | None = None) -> str:
         longest = max(RETENTION_DAYS.values()) * 24
         if age_h is None:
             return ("No span history yet; every figure below the measured "
                     "section is a projection from nothing. Seed some traffic.")
+
+        parts = []
         if age_h < 24:
-            return (f"This database holds {age_h:.1f}h of spans against a "
-                    f"{longest}h longest retention. Bytes per row are real; "
-                    "the monthly figure is an extrapolation and should be "
-                    "quoted as one.")
-        return (f"{age_h:.1f}h of history against a {longest}h longest "
-                "retention. Steady state is still projected, not observed.")
+            parts.append(
+                f"This database holds {age_h:.1f}h of spans against a "
+                f"{longest}h longest retention. Bytes per row are real; the "
+                "monthly figure is an extrapolation and should be quoted as one.")
+        else:
+            parts.append(
+                f"{age_h:.1f}h of history against a {longest}h longest "
+                "retention. Steady state is projected, not observed.")
+
+        # Named rather than merely reported: a projection built on a lifetime
+        # average while traffic has just changed by an order of magnitude is
+        # wrong in a knowable direction, and the direction is the useful part.
+        if rate_ratio is not None and rate_ratio > 2.0:
+            parts.append(
+                f"Current ingest is {rate_ratio:.1f}x the lifetime average, so "
+                "the disk projection UNDERSTATES steady state by roughly that "
+                "factor. Let the rate hold for a while before quoting a bill.")
+        elif rate_ratio is not None and rate_ratio < 0.5:
+            parts.append(
+                f"Current ingest is {rate_ratio:.2f}x the lifetime average, so "
+                "the disk projection OVERSTATES steady state -- it is still "
+                "carrying bytes from a busier period.")
+        return " ".join(parts)

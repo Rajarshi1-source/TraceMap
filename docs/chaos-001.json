@@ -1,0 +1,230 @@
+{
+  "started": "2026-09-04T07:26:39.592606+00:00",
+  "container": "tracemap-clickhouse-1",
+  "outage_s": 120,
+  "kill_wall_ch": "2026-09-04 07:26:56",
+  "events": [
+    {
+      "event": "baseline",
+      "spans": "6618766",
+      "wall": "2026-09-04T07:26:39.592606+00:00",
+      "t": 0.2
+    },
+    {
+      "phase": "before",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 7.9,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 200,
+      "healthz": 200,
+      "t": 1.7
+    },
+    {
+      "phase": "before",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 4.4,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 200,
+      "healthz": 200,
+      "t": 6.8
+    },
+    {
+      "phase": "before",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 9.5,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 200,
+      "healthz": 200,
+      "t": 11.9
+    },
+    {
+      "event": "kill",
+      "container": "tracemap-clickhouse-1",
+      "ch_now": "2026-09-04 07:26:56",
+      "t": 16.9
+    },
+    {
+      "phase": "outage",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 8.9,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 25.4
+    },
+    {
+      "phase": "outage",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 23.0,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 39.3
+    },
+    {
+      "phase": "outage",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": true,
+      "age_s": 36.9,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 53.2
+    },
+    {
+      "phase": "outage",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": true,
+      "age_s": 50.8,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 67.2
+    },
+    {
+      "phase": "outage",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 84.9
+    },
+    {
+      "phase": "outage",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 102.7
+    },
+    {
+      "phase": "outage",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 120.4
+    },
+    {
+      "phase": "outage",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 138.3
+    },
+    {
+      "event": "restart",
+      "t": 148.3
+    },
+    {
+      "phase": "recovery",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 153.5
+    },
+    {
+      "phase": "recovery",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 163.6
+    },
+    {
+      "phase": "recovery",
+      "graph_status": 500,
+      "graph_err": null,
+      "stale": null,
+      "age_s": null,
+      "source": null,
+      "edges": 0,
+      "readyz": 503,
+      "healthz": 200,
+      "t": 173.8
+    },
+    {
+      "event": "clickhouse_answering",
+      "after_restart_s": 30.9,
+      "t": 183.8
+    },
+    {
+      "phase": "recovery",
+      "graph_status": 200,
+      "graph_err": null,
+      "stale": false,
+      "age_s": 0.3,
+      "source": "cache",
+      "edges": 5,
+      "readyz": 200,
+      "healthz": 200,
+      "t": 183.9
+    },
+    {
+      "event": "graph_fresh_again",
+      "after_restart_s": 31.0,
+      "t": 183.9
+    },
+    {
+      "event": "draining",
+      "seconds": 90,
+      "t": 183.9
+    },
+    {
+      "event": "final",
+      "spans_before": "6618766",
+      "spans_after": "6747463",
+      "spans_in_outage_window": "52840",
+      "spans_last_60s": "22304",
+      "outage_s": 120,
+      "ch_answering_after_restart_s": 30.9,
+      "graph_fresh_after_restart_s": 31.0,
+      "t": 273.9
+    }
+  ]
+}

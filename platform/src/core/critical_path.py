@@ -113,14 +113,34 @@ def _walk(span: Span,
                            span.start_ns, cursor_ns))
 
 
-def attribute_to_edges(spans: list[Span],
-                       segments: list[Segment]) -> dict[tuple[str, str], float]:
-    """Attribute critical-path milliseconds to each source->target service edge.
+def attribute_to_child_spans(spans: list[Span],
+                             segments: list[Segment]) -> dict[str, float]:
+    """Critical-path milliseconds per CROSS-SERVICE CHILD SPAN.
 
-    An edge's contribution is the critical-path time spent anywhere inside the
-    callee's subtree - its own work plus everything it waited on.
+    One entry per call, keyed by the child span id -- not per service pair.
+    A call's contribution is the critical-path time spent anywhere inside its
+    own subtree: its own work plus everything it waited on.
 
-    M5: every cross-service edge gets a key, INCLUDING zero-blame ones. The
+    F41, and this is the primitive that fixes it. `attribute_to_edges` folds
+    these into one number per service pair, which is the right shape for a
+    whole-trace summary and the WRONG shape for the per-call rows the assembler
+    writes. When `order-svc` calls `payment-svc` twice in a trace -- a retry, or
+    the saga's compensation after a sibling fails -- the pair total was written
+    to BOTH rows, so:
+
+      * `crit_ms_sum` in the roll-up counted that blame twice;
+      * the TDigest was fed the pair total once per call, overstating the
+        per-call critical latency the dependency map ranks on;
+      * individual rows carried `critical_ms > duration_ms`, which is
+        definitionally impossible -- an edge cannot contribute more
+        user-visible time than the call itself took.
+
+    Measured on this repository before the fix: 4.83% of `order-svc->payment-svc`
+    rows violated that invariant, against 3.9% of its traces making two or more
+    calls. The edge the flagship exists to identify was the edge most
+    over-blamed, because it is the one with a compensation path.
+
+    M5: every cross-service child gets a key, INCLUDING zero-blame ones. The
     dependency map must still draw an edge that has traffic and errors but no
     blame; a missing key would make it disappear instead of fade.
     """
@@ -151,9 +171,34 @@ def attribute_to_edges(spans: list[Span],
                 + subtree_ms.get(sid, 0.0)
             )
 
-    edges: dict[tuple[str, str], float] = defaultdict(float)
+    out: dict[str, float] = {}
     for sid, span in by_id.items():
         parent = by_id.get(span.parent_span_id)
         if parent and parent.service != span.service:
-            edges[(parent.service, span.service)] += subtree_ms.get(sid, 0.0)
+            out[sid] = subtree_ms.get(sid, 0.0)
+    return out
+
+
+def attribute_to_edges(spans: list[Span],
+                       segments: list[Segment]) -> dict[tuple[str, str], float]:
+    """Attribute critical-path milliseconds to each source->target service edge.
+
+    The whole-trace summary: the sum of every call on that edge. Defined in
+    terms of `attribute_to_child_spans` rather than recomputing, so the per-call
+    rows and the per-edge total cannot drift apart -- which is the state F41
+    left them in.
+
+    An edge's contribution is the critical-path time spent anywhere inside the
+    callee's subtree - its own work plus everything it waited on.
+
+    M5: every cross-service edge gets a key, INCLUDING zero-blame ones. The
+    dependency map must still draw an edge that has traffic and errors but no
+    blame; a missing key would make it disappear instead of fade.
+    """
+    by_id = {s.span_id: s for s in spans}
+    edges: dict[tuple[str, str], float] = defaultdict(float)
+    for sid, ms in attribute_to_child_spans(spans, segments).items():
+        span = by_id[sid]
+        edges[(by_id[span.parent_span_id].service, span.service)] += ms
     return dict(edges)
+

@@ -20,7 +20,11 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 
-from src.core.critical_path import Span, attribute_to_edges, compute_critical_path
+from src.core.critical_path import (
+    Span,
+    attribute_to_child_spans,
+    compute_critical_path,
+)
 from src.integrations.clickhouse_client import ClickHouseClient
 from workers._runner import run_forever, serve_metrics
 
@@ -253,22 +257,29 @@ def assemble_trace(
     # rows: the call happened, it just did not make the user wait.
     path_spans, async_ids = split_async(spans, kinds or {})
 
-    # F3 - attribute_to_edges recurses in _depth() at the same tree depth, so it
+    # F3 - attribution recurses in _depth() at the same tree depth, so it
     # belongs INSIDE the guard, not after it. A trace deep enough to blow the
     # stack must skip cleanly rather than kill the cycle.
+    #
+    # F41 - keyed by CHILD SPAN, not by service pair. One row per call, each
+    # carrying its own subtree's critical time. Keying by the pair gave every
+    # call in a trace the pair TOTAL, so an edge called twice -- a retry, or
+    # the saga's compensation -- had its blame counted once per row.
     try:
         segments = compute_critical_path(path_spans)
         if not segments:
             return [], []
-        crit_by_edge = attribute_to_edges(path_spans, segments)
+        crit_by_child = attribute_to_child_spans(path_spans, segments)
     except RecursionError:
         log.warning("trace %s too deep; skipping", trace_id)
         return [], []
 
     # Floor sub-skew contributions to zero rather than reporting a precision the
-    # clocks cannot support.
-    crit_by_edge = {
-        k: (0.0 if v < SKEW_FLOOR_MS else v) for k, v in crit_by_edge.items()
+    # clocks cannot support. Applied per call now rather than per service pair
+    # (F41): the floor is a statement about what a single measurement can
+    # resolve, so applying it to a sum of calls was testing the wrong quantity.
+    crit_by_child = {
+        k: (0.0 if v < SKEW_FLOOR_MS else v) for k, v in crit_by_child.items()
     }
 
     by_id = {s.span_id: s for s in spans}
@@ -293,7 +304,7 @@ def assemble_trace(
                 # The map needs it to fade the edge out rather than drop it.
                 "critical_ms": (
                     0.0 if s.span_id in async_ids
-                    else crit_by_edge.get((parent.service, s.service), 0.0)
+                    else crit_by_child.get(s.span_id, 0.0)
                 ),
                 "is_error": int(s.is_error),
                 "target_version": s.version,
