@@ -701,7 +701,7 @@ nobody should trust.
 ## 2h. Found while building (Phases 7–8)
 
 Twenty-one findings. **Eleven in the harness, three in the detector, two in the
-environment it needs, five found in Phase 8 by running the system rather than
+environment it needs, six found in Phase 8 by running the system rather than
 reading it, and one still open (F38)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
@@ -1680,6 +1680,79 @@ false positives on the noisiest edge is exactly what F43 set out to do, and it
 worked. The open question is whether that gain survives correct gating, or
 whether it came *from* the runaway. Only a run answers that, which is the whole
 point of having one.
+
+### F44 — 🔴 A case's premise can be false on the host it runs on — FIXED
+
+**Found by** doing the arithmetic on what it would take to clear the gate, after
+four red runs, instead of dispatching a fifth.
+
+The precision floor is 0.870 over twelve cases with no false negatives. That
+means **at most one wrong case out of twelve** — and four distinct failure
+classes were in play. So the question stopped being "which threshold next" and
+became "are all twelve of these cases even measuring the detector".
+
+Two of them are not.
+
+Case 009 injects a 250 ms CPU burn into `user-svc` and asserts that this carries
+`order-svc->user-svc` past `order-svc->payment-svc` and onto the critical path.
+The margin is computed against a constant:
+
+```
+order-svc->payment-svc critical p99
+  157.0 ms   declared, eval/topology.py
+  187.97 ms  measured, run 33887207039 (pre-fault snapshot)
+  ~289 ms    measured, run 33870357809
+```
+
+**The thing the margin is measured against moves by more than the margin.** At
+289 ms the burn does not overtake payment, `user-svc` correctly carries no
+blame, and a detector doing exactly the right thing is scored a false negative —
+which is precisely what happened in every run.
+
+This is **F42's lesson generalised.** F42 was one declared constant (a decoy's
+zero-blame baseline) that had stopped being true; the fix asserted that one
+constant against measurement. The same failure exists for every case whose
+premise is an ordering, and asserting them one at a time as each is discovered
+is how the third instance gets found in production.
+
+**Fixed:** cases declare their preconditions, and the runner checks them against
+the topology it snapshots before injecting anything.
+
+```yaml
+preconditions:
+  - kind: overtakes
+    edge: "order-svc->payment-svc"
+    margin_ms: 40          # bucket-to-bucket p99 noise is ~±20ms; a margin
+                           # under that is a check that fails intermittently
+```
+
+A case whose premise does not hold is **not run**, is recorded as
+`invalid_precondition`, and is excluded from every ratio. That is not adjusting
+a score. It is declining to make a measurement the apparatus cannot support and
+saying so, exactly as preflight declines to start on an idle stack rather than
+producing a number from one. Injecting a fault whose premise is already false
+burns ten minutes to produce something meaningless.
+
+**Three guards, because "exclude the inconvenient cases" is otherwise the
+easiest way to turn a gate green:**
+
+1. Preconditions live in the case files — version-controlled, reviewable, and
+   diffable like any other assertion.
+2. The scoreboard says **"Scored over 11 of 12 cases"** directly under the
+   verdict, not in a details block. A score over ten cases gets quoted as
+   though it covered twelve unless the gap is impossible to miss.
+3. `MAX_EXCLUSIONS = 2`. Past that the run fails outright: it is no longer a
+   measurement of the detector, it is a measurement of the gap between the
+   golden set and the hardware. And `check_regression --update` refuses to
+   record a baseline from any run with exclusions at all — freezing a
+   subset-score as the reference would quietly redefine what "the golden set"
+   means, in the direction of whichever cases this host finds inconvenient.
+
+**What this does not claim.** It does not make the gate pass. The arithmetic
+says F43 plus parent suppression reaches precision 0.833 against a 0.870 floor,
+so at least one more real defect stands between here and green. What it does is
+stop the harness from charging the detector for cases the harness cannot run —
+which is the difference between a score that is low and a score that is wrong.
 
 ---
 

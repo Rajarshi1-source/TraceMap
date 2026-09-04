@@ -363,12 +363,68 @@ a 600 ms fault.
    fact was available from reading the code; the second was invisible to the
    unit test written specifically to prevent it.
 
-### The open question, stated rather than assumed
+### What the arithmetic said, and why there was no fifth run
+
+Before dispatching another ninety minutes, the obvious question: what would it
+actually take to clear this gate?
+
+```
+ 9 of 12 correct -> precision 0.750  FAIL
+10 of 12 correct -> precision 0.833  FAIL
+11 of 12 correct -> precision 0.917  PASS
+```
+
+**At most one wrong case out of twelve**, and four distinct failure classes were
+in play. So the useful question stopped being "which threshold next" and became
+**"are all twelve of these cases even measuring the detector?"**
+
+Two of them are not — **F44**. Case 009 injects a 250 ms CPU burn and asserts it
+carries `order-svc->user-svc` past `order-svc->payment-svc`. That margin is
+computed against a constant recorded at 157.0 ms. The same edge has now been
+measured at **187.97 ms** and at **~289 ms** on CI. The thing the margin is
+measured against moves by more than the margin, and at 289 ms the burn does not
+overtake at all — `user-svc` correctly carries no blame, and a detector doing
+exactly the right thing is scored a false negative.
+
+That is F42's lesson generalised: F42 was one declared constant that had stopped
+being true, and fixing them one at a time as each is discovered is how the third
+instance gets found in production.
+
+**Cases now declare their preconditions**, checked against the topology
+snapshotted before any fault goes in:
+
+```yaml
+preconditions:
+  - kind: overtakes
+    edge: "order-svc->payment-svc"
+    margin_ms: 40
+```
+
+A case whose premise does not hold is not run, is recorded as
+`invalid_precondition`, and is excluded from every ratio. **That is not adjusting
+a score** — it is declining to make a measurement the apparatus cannot support,
+exactly as preflight declines to start on an idle stack rather than producing a
+number from one.
+
+Three guards, because "exclude the inconvenient cases" is otherwise the easiest
+way to turn a gate green: preconditions live in version-controlled case files;
+the scoreboard prints **"Scored over 11 of 12 cases"** directly under the
+verdict rather than in a details block; and past `MAX_EXCLUSIONS = 2` the run
+fails outright, while `check_regression --update` refuses to record a baseline
+from a run with *any* exclusions.
+
+### The open question, still open
 
 With correct gating, does the null-case gain survive — or did it come *from* the
-runaway? The bar that suppressed `gateway-svc→order-svc` may have been a bar that
-had already walked upward. **Only a run answers that**, and guessing would be
-exactly the failure mode this whole document exists to prevent.
+runaway? The bar that suppressed `gateway-svc→order-svc` may have been one that
+had already walked upward. Only a run answers that, and the next run now answers
+it against a set that can no longer charge the detector for its own broken
+premises.
+
+**What the arithmetic does not promise.** F43 plus parent suppression reaches
+precision 0.833 against a 0.870 floor. At least one more real defect — the decoy
+case, or the cascade — stands between here and green. F44 does not close that
+gap; it stops the harness from widening it.
 
 ### What is not being done about it
 

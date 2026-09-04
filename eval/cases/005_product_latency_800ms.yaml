@@ -31,3 +31,12 @@ expect:
     # gateway-svc->product-svc is unaffected. This trap proves endpoint
     # scoping works; without it a sloppy injector looks identical.
     - "gateway-svc->product-svc"
+
+# 800ms is chosen to clear payment by a wide margin on any plausible host, so
+# this precondition is expected to hold everywhere. It is declared anyway: a
+# precondition that only appears on cases already known to be fragile is
+# documentation, not a check.
+preconditions:
+  - kind: overtakes
+    edge: "order-svc->payment-svc"
+    margin_ms: 40

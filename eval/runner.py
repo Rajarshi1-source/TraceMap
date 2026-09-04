@@ -46,7 +46,17 @@ import httpx
 import yaml
 
 from eval.injectors import assert_all_clear, clear_all, get_injector
-from eval.scorer import FALSE_NEGATIVE, FALSE_POSITIVE, TRUE_POSITIVE, WRONG_EDGE, Scores, score_run
+from eval.preconditions import check as check_preconditions
+from eval.preconditions import invalid_cases
+from eval.scorer import (
+    FALSE_NEGATIVE,
+    FALSE_POSITIVE,
+    INVALID_PRECONDITION,
+    TRUE_POSITIVE,
+    WRONG_EDGE,
+    Scores,
+    score_run,
+)
 from eval.topology import CRIT_P99_BASELINE_MS, THRESHOLD_MS
 
 log = logging.getLogger("eval.runner")
@@ -619,9 +629,19 @@ async def main_async(args: argparse.Namespace) -> int:
     # score and the reason it cannot be trusted travel together.
     topology_at_start: dict[str, float] = {}
     invalid_traps: list[str] = []
+    precondition_results: list = []
+    invalid_premise: list[str] = []
     try:
         topology_at_start = await api.edge_critical_p99()
         invalid_traps = invalid_decoy_traps(topology_at_start)
+        # F44. The same question one level up: not "is this decoy still a
+        # decoy" but "does this case's ordering still hold on this host". Case
+        # 009 budgets a 250ms burn against a payment edge recorded at 157ms;
+        # that edge has been measured at 188ms and at 289ms on CI, and at 289
+        # the burn does not overtake it at all.
+        for _stem, c in cases:
+            precondition_results += check_preconditions(c, topology_at_start)
+        invalid_premise = invalid_cases(precondition_results)
     except Exception as exc:  # noqa: BLE001 - a missing snapshot must not stop
         # a ninety-minute run; it just means this scoreboard cannot self-audit,
         # and the artifact says so rather than implying validity.
@@ -633,10 +653,38 @@ async def main_async(args: argparse.Namespace) -> int:
                     "asserting something false; this scoreboard measures the "
                     "harness as much as the detector")
 
+    for r in precondition_results:
+        log.info("precondition %-9s %s", "OK" if r.holds else "INVALID", r)
+    if invalid_premise:
+        log.warning("PREMISE INVALID on this host -- %s",
+                    ", ".join(invalid_premise))
+        log.warning("those cases assert an ordering the measured topology "
+                    "contradicts. They will be recorded as "
+                    "invalid_precondition and excluded from the score, "
+                    "because a case that cannot detect what it claims is not "
+                    "a case the detector failed.")
+
     results: list[dict] = []
     aborted: str | None = None
     try:
         for i, (_stem, case) in enumerate(cases):
+            if case.get("name") in invalid_premise:
+                # Not run at all. Injecting a fault whose premise is already
+                # false burns ten minutes to produce a number that means
+                # nothing, and the trap edges would be asserted anyway.
+                why = next(r.detail for r in precondition_results
+                           if r.case == case["name"] and not r.holds)
+                log.warning("skip    %-28s premise does not hold: %s",
+                            case["name"], why)
+                results.append({
+                    "case_name": case["name"],
+                    "expected_edge": (case.get("expect") or {}).get("edge"),
+                    "detected_edge": None,
+                    "detected_at_s": None,
+                    "outcome": INVALID_PRECONDITION,
+                    "detail": why,
+                })
+                continue
             results.append(await run_case(case, api, args.git_sha))
             if i < len(cases) - 1:
                 cleared = await reset_alert_suppression()
@@ -689,6 +737,11 @@ async def main_async(args: argparse.Namespace) -> int:
                "topology_at_start": topology_at_start,
                "traps_valid": not invalid_traps,
                "invalid_traps": invalid_traps,
+               # F44: which cases could not measure what they claim, and why.
+               "invalid_preconditions": invalid_premise,
+               "preconditions": [
+                   {"case": r.case, "kind": r.kind, "holds": r.holds,
+                    "detail": r.detail} for r in precondition_results],
                "scores": scores.as_dict(), "cases": results}
     # Two small synchronous writes at the very end of a ~90-minute run, after
     # every case has finished. Reaching for aiofiles here would add a

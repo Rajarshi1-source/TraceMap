@@ -40,3 +40,28 @@ expect:
     # Payment is untouched and is displaced from the critical path by a
     # saturated user-svc, so its critical p99 falls rather than rises.
     - "order-svc->payment-svc"
+
+# The premise, asserted against the host rather than assumed from a constant.
+#
+# This case only means anything if the burn actually carries user-svc past
+# payment and onto the critical path. `eval/topology.py` records payment at
+# 157.0ms, but that number was measured on one machine and this set runs on
+# another:
+#
+#   187.97 ms  measured, run 33887207039 (pre-fault snapshot)
+#   ~289   ms  measured, run 33870357809
+#
+# A 250ms burn against a declared 157ms is a 93ms margin, and the thing it is
+# measured against moves by more than that between runs. At 289ms the burn does
+# not overtake, user-svc correctly carries no blame, and a detector doing
+# exactly the right thing is scored a false negative.
+#
+# So the ordering is checked before the fault goes in. If it does not hold, the
+# case is excluded and SAID SO, rather than being charged to the detector.
+preconditions:
+  - kind: overtakes
+    edge: "order-svc->payment-svc"
+    # 40ms clear of it. Bucket-to-bucket p99 noise is roughly +/-20ms, so a
+    # margin under that is a case that fails intermittently -- and an
+    # intermittent case gets deleted rather than debugged.
+    margin_ms: 40

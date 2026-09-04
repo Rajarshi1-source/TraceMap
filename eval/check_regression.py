@@ -153,6 +153,26 @@ def main() -> int:
     baseline_path = Path(args.baseline or f"eval/baselines/main-{tier}.json")
 
     if args.update:
+        # F44. A baseline is the number every future run is judged against, so
+        # it has to come from a run that measured the whole set. A run with
+        # excluded cases produced a real score over a SUBSET, and freezing that
+        # as the reference would quietly redefine what "the golden set" means --
+        # and would do it in the direction of whichever cases this host happens
+        # to find inconvenient. Same reasoning as refusing to update a baseline
+        # from a red run, one level further out.
+        excluded = current.get("excluded") or []
+        if excluded:
+            print(f"\n  refusing to record a baseline from a run that skipped "
+                  f"{len(excluded)} case(s): {', '.join(excluded)}.\n"
+                  "  Their preconditions did not hold on that host, so the run\n"
+                  "  measured a subset. Re-derive the case constants for this\n"
+                  "  hardware, or run where the set's premises hold.\n",
+                  file=sys.stderr)
+            return 2
+        if current_full.get("invalid_traps"):
+            print("\n  refusing to record a baseline from a run whose traps "
+                  "were invalid.\n", file=sys.stderr)
+            return 2
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
         baseline_path.write_text(json.dumps(current_full, indent=2) + "\n",
                                  encoding="utf-8")

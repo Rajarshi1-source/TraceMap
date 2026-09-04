@@ -23,6 +23,8 @@ import math
 from dataclasses import asdict, dataclass, field
 from statistics import median
 
+from eval.preconditions import MAX_EXCLUSIONS
+
 # The ABSOLUTE floor: below this the detector is not merely worse than main,
 # it is broken. `check_regression.py` handles the relative question against
 # eval/baselines/main.json, and the two gates fail for different reasons.
@@ -48,7 +50,15 @@ FALSE_NEGATIVE = "false_negative"
 FALSE_POSITIVE = "false_positive"
 WRONG_EDGE = "wrong_edge"
 
-OUTCOMES = (TRUE_POSITIVE, FALSE_NEGATIVE, FALSE_POSITIVE, WRONG_EDGE)
+# F44. A case whose PREMISE did not hold on this host. Not a fifth way for the
+# detector to be wrong -- a case that was never run, because the ordering it
+# asserts was measurably false before any fault went in. Excluded from every
+# ratio below and named on the scoreboard, the same way preflight declines to
+# start on an idle stack rather than producing a number from one.
+INVALID_PRECONDITION = "invalid_precondition"
+
+OUTCOMES = (TRUE_POSITIVE, FALSE_NEGATIVE, FALSE_POSITIVE, WRONG_EDGE,
+            INVALID_PRECONDITION)
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -83,6 +93,11 @@ class Scores:
     fn: int = 0
     detected: int = 0
     total: int = 0
+    # F44: cases whose declared ordering did not hold on this host, and which
+    # were therefore never scored. Carried on the result rather than logged,
+    # because a score that silently covers ten cases instead of twelve is the
+    # kind of thing that gets quoted as though it covered twelve.
+    excluded: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -133,8 +148,20 @@ class Scores:
             f"| mttd p95 | {fmt(self.mttd_p95_s)} | <= {BASELINE['mttd_p95_s'] * TOLERANCE_MTTD:.0f}s |",
         ]
         verdict = "**PASS**" if self.passed else "**FAIL**"
+        scored = self.tp + self.fp + self.fn
         out = [head, "", *rows, "", f"{verdict} - {self.tp} tp / {self.fp} fp / {self.fn} fn "
                f"over {self.total} cases"]
+        # F44. Directly under the verdict, not in a details block. A score
+        # computed over ten cases instead of twelve gets quoted as though it
+        # covered twelve unless the difference is impossible to miss.
+        if self.excluded:
+            out += ["", f"> **Scored over {scored} of {self.total} cases.** "
+                    f"{len(self.excluded)} had preconditions that do not hold "
+                    "on this host and were not run: "
+                    + ", ".join(f"`{c}`" for c in self.excluded) + ". "
+                    "Their declared ordering was contradicted by the measured "
+                    "topology before any fault was injected, so they could not "
+                    "have detected what they claim."]
         if self.failures:
             out += ["", "<details><summary>gate failures</summary>", ""]
             out += [f"- {f}" for f in self.failures]
@@ -145,6 +172,12 @@ class Scores:
 
 
 def score_run(results: list[dict]) -> Scores:
+    # Excluded before anything is counted. A ratio computed over cases that
+    # could not measure what they claim is not a worse measurement, it is a
+    # different one wearing the same name.
+    excluded = [r for r in results if r["outcome"] == INVALID_PRECONDITION]
+    results = [r for r in results if r["outcome"] != INVALID_PRECONDITION]
+
     tp = sum(r["outcome"] == TRUE_POSITIVE for r in results)
     fp = sum(r["outcome"] in (FALSE_POSITIVE, WRONG_EDGE) for r in results)
     fn = sum(r["outcome"] == FALSE_NEGATIVE for r in results)
@@ -160,6 +193,15 @@ def score_run(results: list[dict]) -> Scores:
     p95 = percentile(latencies, 0.95)
 
     failures: list[str] = []
+    # More than a couple of cases invalidated and this run is not a measurement
+    # of the detector at all -- it is a measurement of the gap between the
+    # golden set and the hardware, and it must not be quotable as a score.
+    if len(excluded) > MAX_EXCLUSIONS:
+        failures.append(
+            f"{len(excluded)} of {len(results) + len(excluded)} cases had "
+            f"invalid preconditions on this host (ceiling {MAX_EXCLUSIONS}) -- "
+            "the golden set does not fit this hardware; re-derive its "
+            "constants rather than quoting this score")
     if f1 < BASELINE["f1"] - TOLERANCE_ABS:
         failures.append(f"f1 {f1:.3f} below floor "
                         f"{BASELINE['f1'] - TOLERANCE_ABS:.3f}")
@@ -178,7 +220,13 @@ def score_run(results: list[dict]) -> Scores:
         mttd_p95_s=round(p95, 1) if p95 != float("inf") else p95,
         passed=not failures,
         tp=tp, fp=fp, fn=fn,
+        excluded=[r["case_name"] if "case_name" in r else r.get("name", "?")
+                  for r in excluded],
         detected=len(latencies),
-        total=len(results),
+        # Every case the run was ASKED to cover, including the ones excluded.
+        # Reporting the post-filter count would make "scored 11 of 11" true and
+        # useless -- the whole point is the gap between what was asked and what
+        # could be measured.
+        total=len(results) + len(excluded),
         failures=failures,
     )

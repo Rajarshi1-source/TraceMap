@@ -39,14 +39,18 @@ by design.
 > **F43** and produced the most useful failure of the set — both null cases
 > passed for the first time, and recall halved, because the fix's second pass
 > reintroduced M6's boiling frog one derivative up (**F43b**). Reverted, with the
-> test that catches it. [`docs/EVAL.md §9`](docs/EVAL.md) has all four runs and
-> what each one bought.
+> test that catches it. There was no fifth run: the arithmetic says the gate
+> needs 11 of 12 cases, and **two of the twelve turned out not to be measuring
+> the detector at all** (**F44**) — their premise is an ordering computed against
+> a constant the CI host contradicts. Cases now assert their own preconditions
+> and are excluded, loudly, when those do not hold.
+> [`docs/EVAL.md §9`](docs/EVAL.md) has all four runs and what each one bought.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
 >
-> Forty-three defects are logged in
-> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), five of them found in
+> Forty-four defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), six of them found in
 > Phase 8 by running the system rather than reading it.
 
 ---
