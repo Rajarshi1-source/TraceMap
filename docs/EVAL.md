@@ -237,11 +237,9 @@ entire claim.
 ### On this repository's own numbers
 
 The full-set baseline is recorded by a green `full` run on `main` and committed
-in the same change that explains why it moved. Until such a run has completed,
-`eval/baselines/main-full.json` is absent and `check_regression.py` exits 2 —
-which is the designed behaviour for "not yet measured", and is why this document
-contains a methodology and no scoreboard.
-
+in the same change that explains why it moved. **No such run has happened yet**,
+so `eval/baselines/main-full.json` is absent and `check_regression.py` exits 2 —
+the designed behaviour for "not yet measured".
 A local run on a developer machine is **not** a substitute for that. Detection
 latency is measured against `time.monotonic()`, which keeps advancing while the
 process is descheduled; a host that stalls a worker for seven minutes (F36,
@@ -250,3 +248,80 @@ such a stall, because the runner queries anomalies *since case start* from
 Postgres and still sees what fired during it — but the latency figures do not,
 and MTTD p95 is one third of the baseline. That is why the full set is run on
 dedicated CI hardware and not locally.
+
+---
+
+## 9. The first full-set run — and it failed
+
+Recorded here rather than quietly re-run until it passed, because a harness
+whose failures are not published is a harness nobody should believe.
+
+**Run [33848444520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520),
+tier `full`, 12 cases, `8308c692`, on CI hardware.**
+
+| metric | value | gate | |
+|---|---|---|---|
+| precision | **0.583** | ≥ 0.870 | ✗ |
+| recall | **1.000** | — | |
+| f1 | **0.737** | ≥ 0.820 | ✗ |
+| mttd p50 | 122 s | — | |
+| mttd p95 | **213 s** | ≤ 432 s | ✓ |
+
+7 true positives, 5 false positives, **0 false negatives**.
+
+### What the shape of it says
+
+**Recall is 1.000 and precision is 0.583.** The detector misses nothing and
+over-alerts. That is a much better failure than the reverse — a detector that
+misses incidents is useless, one that over-alerts is noisy — but it is still a
+failure, and the gate is right to say so.
+
+**MTTD p95 of 213 s clears the 432 s ceiling with room to spare**, which is the
+first time that number has been measurable at all: detection latency is measured
+against `time.monotonic()`, which keeps advancing while a process is descheduled,
+so a local run on a host that stalls a worker (F36: 471 s, measured) inflates
+every latency in the set. This is what dedicated CI hardware buys.
+
+### The five failures, and their single cause
+
+| Case | Outcome | Blamed |
+|---|---|---|
+| `null_traffic_ramp` | false positive | `gateway-svc→order-svc` — nothing was injected |
+| `parallel_decoy` | false positive | got `order-svc→payment-svc` **correctly**, and *also* alerted on the decoy `order-svc→user-svc` |
+| `user_cpu_saturation` | wrong edge | `gateway-svc→order-svc`, expected `order-svc→user-svc` |
+| `payment_db_down` | wrong edge | `gateway-svc→order-svc`, expected `order-svc→payment-svc` |
+| `gateway_latency_cascade` | false positive | got `gateway-svc→order-svc` **correctly**, and *also* blamed `order-svc→payment-svc` |
+
+**`gateway-svc→order-svc` appears in three of the five.** That edge absorbs
+`order-svc`'s entire subtree by design — it is 735.0 in the specification test,
+because the gateway really did wait 735 ms on order. So *any* downstream
+degradation raises it too. It is not wrong; it is **redundant**. The detector
+reports the parent and the child, and the scorer counts the parent as a wrong
+edge.
+
+Two of the five are the same shape one level down: the right edge *was* found,
+and a second alert on a trap edge cost the case.
+
+So the diagnosis is one structural gap, not five unrelated bugs: **there is no
+parent suppression.** When a parent edge's critical-path increase is fully
+explained by a child's in the same window, it is the same finding one level up,
+not an independent one. Alerting on both doubles the noise and, when a single
+alert is taken as "the answer", points at the gateway instead of the culprit.
+
+### What was done about it
+
+Not a threshold change. Tuning to clear a gate is exactly what M8 forbids, and
+"precision was low so we lowered the floor" is indistinguishable from having no
+gate.
+
+Instead, **F41** — a genuine correctness defect found separately while the run
+was in flight. The assembler was filling per-call rows from a map keyed by
+service pair, so a retry or the saga's compensation gave every call on an edge
+the pair total. Measured on live data: 4.83% of `order-svc→payment-svc` rows
+carried `critical_ms > duration_ms`, which is definitionally impossible. Since
+`crit_p99` is what the detector alerts on and the map ranks by, that inflation
+plausibly contributes to several of the failures above — including the decoy.
+
+The set is being re-run against the fix. **Whatever it reports will be recorded
+here, passing or not.** A baseline will be committed from a green run and from
+nothing else.

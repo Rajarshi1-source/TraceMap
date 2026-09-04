@@ -47,6 +47,28 @@ not optional and not a separate step.
 `make` on its own lists every target. `make monitoring` adds Prometheus and
 Grafana — they are deliberately *not* in the core profile; see below.
 
+<details><summary>This was tested from an actual clean clone, not assumed</summary>
+
+`git clone` into an empty directory, `make env`, then a `--no-cache` rebuild of
+every image and a boot onto **fresh volumes** under a separate compose project —
+so nothing was inherited from the development machine:
+
+- 16 containers healthy
+- ClickHouse `docker-entrypoint-initdb.d` applied all eight schema files,
+  including the newest — `edge_slo_1m` and its materialised view exist on a
+  volume that has never seen a manual migration
+- `./scripts/smoke-test.sh` → **SMOKE PASS**, one request through all five
+  services
+- 100 s of k6 traffic → a populated graph with `order-svc → user-svc` at
+  **58.98 ms wall clock and 0.0 ms critical**
+
+The one thing this does *not* prove is the letter of the exit criterion, which
+says "on a machine that is not yours". Fresh clone, fresh volumes and
+`--no-cache` images remove most of what that is guarding against, but not a
+different OS or a different CPU architecture. Stated rather than glossed.
+
+</details>
+
 **Cost to run: €7.05/month.** One Hetzner CX32, measured rather than estimated —
 [`docs/COST.md`](docs/COST.md) shows the working, including the 56 bytes on disk
 per span it is derived from.
@@ -261,6 +283,7 @@ The parts that are easy to skip and are the reason to trust the rest.
 | [`docs/COST.md`](docs/COST.md) | The cost model, measured |
 | [`docs/SCALING.md`](docs/SCALING.md) | The memory floor and what breaks at 10× |
 | [`docs/CHAOS.md`](docs/CHAOS.md) | One real failure experiment, with what it falsified |
+| [`docs/DEMO.md`](docs/DEMO.md) | The three-minute walkthrough, and what to say when it breaks |
 | [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) | Where critical-path attribution is wrong |
 | [`docs/POSTMORTEM-001.md`](docs/POSTMORTEM-001.md) | The bug that never ran |
 | [`docs/adr/`](docs/adr/) | Eight ADRs, each written in the phase that earned it |
