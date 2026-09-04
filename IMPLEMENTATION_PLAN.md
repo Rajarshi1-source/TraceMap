@@ -700,8 +700,8 @@ nobody should trust.
 
 ## 2h. Found while building (Phases 7–8)
 
-Nineteen findings. **Eleven in the harness, two in the detector, two in the
-environment it needs, three found in Phase 8 by running the system rather than
+Twenty findings. **Eleven in the harness, two in the detector, two in the
+environment it needs, four found in Phase 8 by running the system rather than
 reading it, and one still open (F38)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
@@ -717,6 +717,9 @@ different kind of exercise and none by a test:
 - **F41** — the flagship number was wrong on 4.83% of rows on the edge that
   matters most, and every average looked fine. Found by checking an invariant
   against live data on a hunch.
+- **F42** — the guard protecting the golden set's central assumption was reading
+  a hardcoded dict, so it could not fail. Found by reading the CI log of a run
+  that had already gone red for what looked like a different reason.
 
 Three deserve reading even if the rest are skipped. **F28** is a gate a correct
 detector could never pass. **F30** is a decoy that punished the detector for
@@ -1373,6 +1376,94 @@ Verified against live data after the fix: **zero violations** on fresh rows, and
 executed against the buggy attribution. That result is recorded in `docs/EVAL.md`
 as it stands, and the set was re-run against the fix rather than the number being
 quietly replaced.
+
+---
+
+### F42 — 🔴 The decoy invariant was checked against the declaration, not the measurement — FIXED
+
+The worst kind of guard: one that occupies the place where a real check should
+be, reports OK, and asserts nothing.
+
+`scripts/topology-guard.py` had exactly one **hard** assertion about decoy
+validity:
+
+```python
+decoys = [e for e, ms in CRIT_P99_BASELINE_MS.items() if ms < THRESHOLD_MS]
+say("at least one leg is still a true parallel sibling", bool(decoys), ...)
+```
+
+`CRIT_P99_BASELINE_MS` is a hardcoded dict in `eval/topology.py`. The check
+therefore asked *"does the declaration still contain a decoy?"* — a constant.
+It could not fail. The real question, whether the leg the case files use as a
+decoy still carries no blame **on the machine the set is about to run on**, was
+only a soft `note()`, printed as DRIFT and deliberately non-fatal.
+
+**What that cost, measured.** In the second full-set CI run the guard printed,
+on quiet traffic, before a single case executed:
+
+```
+crit p99 order-svc->payment-svc  148.0 (recorded 157.0)  OK
+crit p99 order-svc->product-svc   49.0 (recorded  49.3)  OK
+crit p99 order-svc->user-svc      56.6 (recorded   0.0)  DRIFT
+at least one leg is still a true parallel sibling         OK
+```
+
+`order-svc->user-svc` was carrying **56.6 ms of critical path against a declared
+0.0**. On a 2-vCPU contended GitHub runner the fan-out finish order genuinely
+differs from a quiet developer machine, and `user-svc` lands on the critical
+path often enough to matter.
+
+Every `must_not_alert` trap naming that leg was therefore asserting something
+false, and the workflow proceeded anyway. Two of the six failures in that run —
+`payment_latency_60ms` and, worse, **`parallel_decoy`, the flagship case** —
+were scored against a trap that was not a trap. The detector alerted on
+`order-svc->user-svc` at +339 ms, which was **correct behaviour**, and the
+scoreboard recorded it as a false positive.
+
+The scoreboard was measuring the harness, not the detector.
+
+**This is the third time this application has taught the same lesson.** F30 and
+F37 both came from a decoy leg that turned out to carry blame; the fix each time
+was to re-measure and move the decoy. What was missing was a check that fails
+when the assumption stops holding — and the check that looked like it was doing
+that was reading a constant.
+
+**Fixed.** The decoy invariant is now computed from the live graph and is hard:
+
+- a leg declared as a zero-blame sibling that is *measured* at or above
+  `THRESHOLD_MS` fails the guard, naming the leg, the measurement and what it
+  invalidates;
+- "at least one leg is still a true parallel sibling" is now evaluated over the
+  legs that are still valid *by measurement*, so the two checks are independent;
+- when no declared decoy appears in the live graph at all the check reports SKIP
+  rather than a misleading failure — that state is the "declared edge absent"
+  failure above it, which is about missing traffic, not about case design.
+
+The guard already runs in `eval.yml` immediately before the golden set, so this
+now stops a run that would produce a meaningless scoreboard rather than
+annotating it.
+
+**Verified by reproducing the CI condition rather than by reasoning.** +250 ms
+was injected into `user-svc` to make it the slowest sibling, and the guard went
+red with the right message and exit code 1:
+
+```
+every declared decoy leg still carries no blame          FAIL
+    order-svc->user-svc measured 289.6ms critical p99 against a declared 0.0
+    (threshold 50ms). Every case naming it in `must_not_alert` is now
+    asserting something false.
+at least one leg is still a true parallel sibling        OK
+```
+
+With the fault cleared it passes, and `order-svc->user-svc` measures 0.0 on this
+host — which is the whole point: **the decoy is valid here and was not valid
+there, and until now nothing said so.**
+
+**What remains open.** The set still needs a decoy that holds on CI hardware.
+Re-measuring `CRIT_P99_BASELINE_MS` on the runner and picking the leg that is
+genuinely blameless there is the next step, and it must be a measurement rather
+than a choice. Until then the full-tier scoreboard from a GitHub runner carries
+an asterisk, and `docs/EVAL.md` says so.
 
 ---
 

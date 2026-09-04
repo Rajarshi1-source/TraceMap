@@ -114,18 +114,63 @@ def main() -> int:
              f"carries blame, case 006 needs a different decoy, not a "
              f"different delay.")
 
-    decoys = [e for e, ms in CRIT_P99_BASELINE_MS.items() if ms < THRESHOLD_MS]
-    # This one IS hard. If no leg is a sibling any more, the decoy case cannot
-    # be repaired by tuning and the golden set is making a claim the topology
-    # no longer supports.
-    say("at least one leg is still a true parallel sibling", bool(decoys),
-        "every fan-out leg now carries critical-path blame; case 006 has no "
-        "valid decoy and must be redesigned rather than retuned.")
+    # F42. This check was reading CRIT_P99_BASELINE_MS -- the DECLARED values,
+    # a hardcoded dict -- so it asked "does the declaration still contain a
+    # decoy?", which is a constant and can never be false. It printed OK on a
+    # CI runner where `order-svc->user-svc` measured 56.6ms of critical path
+    # against a declared 0.0, and the run proceeded to score six cases whose
+    # `must_not_alert` traps were already invalid.
+    #
+    # A tautological hard check is worse than no hard check: it occupies the
+    # place where the real one should be and reports OK while doing nothing.
+    #
+    # Now measured, and now specific. A leg declared as a zero-blame sibling
+    # that is observed carrying blame past the detector threshold cannot be a
+    # decoy at ANY injected delay -- so every case naming it in `must_not_alert`
+    # is asserting something false, and the scoreboard those cases produce
+    # measures the harness rather than the detector.
+    declared_decoys = [e for e, ms in CRIT_P99_BASELINE_MS.items()
+                       if ms < THRESHOLD_MS]
+    invalid = []
+    still_valid = []
+    for edge in declared_decoys:
+        e = live.get(edge)
+        if e is None:
+            continue
+        measured = float(e.get("critP99") or 0.0)
+        (invalid if measured >= THRESHOLD_MS else still_valid).append(
+            (edge, measured))
+
+    if not (invalid or still_valid):
+        # No declared decoy appears in the live graph at all. That is the
+        # "edges absent" failure above, already reported; asserting decoy
+        # validity against nothing would add a second, misleading failure
+        # pointing at the case design rather than at the missing traffic.
+        print("  decoy validity                                           "
+              "SKIP")
+        print("      no declared decoy leg is present in the live graph -- "
+              "send traffic and re-run")
+    else:
+        say("every declared decoy leg still carries no blame", not invalid,
+            "; ".join(f"{edge} measured {ms:.1f}ms critical p99 against a "
+                      f"declared 0.0 (threshold {THRESHOLD_MS:.0f}ms)"
+                      for edge, ms in invalid)
+            + ". Every case naming it in `must_not_alert` is now asserting "
+              "something false. Re-measure the decoy on THIS host and update "
+              "eval/topology.py, or pick a different leg -- do not change the "
+              "injected delay, and do not run the set until this passes.")
+
+        say("at least one leg is still a true parallel sibling",
+            bool(still_valid),
+            "every fan-out leg now carries critical-path blame; case 006 has "
+            "no valid decoy and must be redesigned rather than retuned.")
 
     print()
-    print("  Structure is asserted; critical-path shares are reported. Run this")
-    print("  on quiet traffic -- a rolling window still holding a recent fault")
-    print("  reads as drift.")
+    print("  Structure and decoy validity are ASSERTED; share drift is reported.")
+    print("  Run this on quiet traffic -- a rolling window still holding a")
+    print("  recent fault reads as drift, and will fail the decoy check for a")
+    print("  real reason: the set must not run while a fault is still in the")
+    print("  window either.")
     print()
     print("  TOPOLOGY GUARD PASS" if not fail else "  TOPOLOGY GUARD FAIL")
     print()

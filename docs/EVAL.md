@@ -80,6 +80,14 @@ argument for the flagship feature, expressed as a number rather than a diagram.
 > and tripped the trap at t+202s. A detector doing exactly the right thing would
 > have scored a false positive. `user-svc` has a measured critical p99 of 0.0 —
 > which is what a parallel sibling actually looks like.
+>
+> **And that measurement is host-dependent, which nobody knew until §9.** On a
+> 2-vCPU contended GitHub runner `order-svc→user-svc` measures **56.6 ms**, not
+> 0.0: the fan-out finish order genuinely differs under CPU contention. So this
+> case is valid on a quiet machine and invalid on CI, and the guard that should
+> have caught that was reading a hardcoded dict (**F42**). Whichever leg is used
+> as the decoy, it has to be re-measured on the hardware the set runs on — this
+> is the third time this application has moved its decoy.
 
 ---
 
@@ -251,97 +259,129 @@ dedicated CI hardware and not locally.
 
 ---
 
-## 9. The first full-set run — and it failed
+## 9. Two full-set runs, both red — and what they actually measured
 
-Recorded here rather than quietly re-run until it passed, because a harness
+Recorded here rather than quietly re-run until they passed, because a harness
 whose failures are not published is a harness nobody should believe.
 
-**Run [33848444520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520),
-tier `full`, 12 cases, `8308c692`, on CI hardware.**
-
-| metric | value | gate | |
+| | Run 1 · [33848444520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | Run 2 · [33860377967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | gate |
 |---|---|---|---|
-| precision | **0.583** | ≥ 0.870 | ✗ |
-| recall | **1.000** | — | |
-| f1 | **0.737** | ≥ 0.820 | ✗ |
-| mttd p50 | 122 s | — | |
-| mttd p95 | **213 s** | ≤ 432 s | ✓ |
+| commit | `8308c692` | `26a3cb629` (F41 fixed) | |
+| precision | 0.583 | **0.500** | ≥ 0.870 ✗ |
+| recall | 1.000 | **1.000** | — |
+| f1 | 0.737 | **0.667** | ≥ 0.820 ✗ |
+| mttd p50 | 122 s | 183 s | — |
+| mttd p95 | 213 s | **214 s** | ≤ 432 s ✓ |
+| outcome | 7 tp / 5 fp / 0 fn | 6 tp / 6 fp / 0 fn | **FAIL** |
 
-7 true positives, 5 false positives, **0 false negatives**.
+**Recall is 1.000 in both runs and there is not a single false negative across
+twenty-four case executions.** The detector misses nothing. It over-alerts —
+a much better failure than the reverse, and still a failure.
 
-### What the shape of it says
+**MTTD p95 is stable at 213 s and 214 s against a 432 s ceiling.** This is the
+number a developer machine cannot produce: detection latency is measured against
+`time.monotonic()`, which keeps advancing while a process is descheduled, so a
+host that stalls a worker (F36: 471 s, measured) inflates every latency in the
+set. Two independent runs landing within one second of each other is what
+dedicated hardware buys.
 
-**Recall is 1.000 and precision is 0.583.** The detector misses nothing and
-over-alerts. That is a much better failure than the reverse — a detector that
-misses incidents is useless, one that over-alerts is noisy — but it is still a
-failure, and the gate is right to say so.
+### Exactly one case moved between runs
 
-**MTTD p95 of 213 s clears the 432 s ceiling with room to spare**, which is the
-first time that number has been measurable at all: detection latency is measured
-against `time.monotonic()`, which keeps advancing while a process is descheduled,
-so a local run on a host that stalls a worker (F36: 471 s, measured) inflates
-every latency in the set. This is what dedicated CI hardware buys.
-
-### The five failures, and their single cause
-
-| Case | Outcome | Blamed |
+| Case | Run 1 | Run 2 |
 |---|---|---|
-| `null_traffic_ramp` | false positive | `gateway-svc→order-svc` — nothing was injected |
-| `parallel_decoy` | false positive | got `order-svc→payment-svc` **correctly**, and *also* alerted on the decoy `order-svc→user-svc` |
-| `user_cpu_saturation` | wrong edge | `gateway-svc→order-svc`, expected `order-svc→user-svc` |
-| `payment_db_down` | wrong edge | `gateway-svc→order-svc`, expected `order-svc→payment-svc` |
-| `gateway_latency_cascade` | false positive | got `gateway-svc→order-svc` **correctly**, and *also* blamed `order-svc→payment-svc` |
+| `payment_latency_60ms` | true positive | **false positive** |
 
-**`gateway-svc→order-svc` appears in three of the five**, and it is worth being
-precise about *why*, because the three are not all the same thing.
+It still found the right edge — `order-svc→payment-svc` — and lost the case to
+an *additional* alert on a trap. Every other case kept its outcome. **F41 did
+not measurably change the score**, and with one run either side it would be
+dishonest to claim it helped or hurt; the failure taxonomy is identical in both.
 
-That edge absorbs `order-svc`'s entire subtree by design — it is 735.0 in the
-specification test, because the gateway really did wait 735 ms on order. It also
-owns roughly 52% of the critical path in steady state. So it is genuinely the
-biggest edge in the system, and *any* downstream degradation raises it too.
+### What the failures actually are — and two of them are the harness
 
-**One of the three is a known open defect, not a new finding.**
-`null_traffic_ramp` is **F38**, recorded open in `IMPLEMENTATION_PLAN.md` with
-the failure already reproduced: the detector cannot distinguish a latency rise
-caused by a regression from one caused by load. Offered load doubles, queueing
-raises p99, nothing is wrong, and every existing gate correctly declines to
-fire — the request-count floor is a *minimum*, the ramp *is* sustained, and the
-blame-share gate agrees the edge really is the bottleneck. F38 is deliberately
-unfixed because the fix needs a second EWMA over throughput and a threshold, and
-picking that threshold without an eval run to justify it is M8. The run this
-document reports is the beginning of that number.
+Six failures in run 2, in three groups.
 
-**Two are a different gap: the parent alerted instead of the child.** In
-`user_cpu_saturation` and `payment_db_down` the culprit edge was real and
-identifiable, and what surfaced was the parent that contains it. When a parent's
-critical-path increase is fully explained by a child's in the same window it is
-the same finding one level up, not an independent one — and when a single alert
-is taken as "the answer", it points at the gateway instead of the culprit.
-Nothing currently suppresses that.
+**Group A — two cases scored against a trap that was not a trap. This is F42.**
 
-**Two are co-alerts.** In `parallel_decoy` and `gateway_latency_cascade` the
-right edge *was* found — the decoy case correctly named `order-svc→payment-svc`
-— and a second alert on a trap edge cost the case anyway. Under the scoring
-rules that is correct: an extra alert on an innocent edge costs the same on-call
+The topology guard printed this on quiet traffic, *before a single case ran*:
+
+```
+crit p99 order-svc->payment-svc  148.0 (recorded 157.0)  OK
+crit p99 order-svc->product-svc   49.0 (recorded  49.3)  OK
+crit p99 order-svc->user-svc      56.6 (recorded   0.0)  DRIFT
+at least one leg is still a true parallel sibling         OK
+```
+
+`order-svc→user-svc` — the decoy, the leg whose whole purpose is carrying **no**
+blame — was measured at **56.6 ms of critical path against a declared 0.0**. On a
+2-vCPU contended GitHub runner the fan-out finish order genuinely differs from a
+quiet developer machine, and `user-svc` lands on the critical path often enough
+to matter.
+
+So when the detector alerted on `order-svc→user-svc` at +339 ms in
+`payment_latency_60ms` and in `parallel_decoy`, **it was right**, and the
+scoreboard recorded it as a false positive twice.
+
+Worse: `parallel_decoy` is the flagship case. On this hardware it was not
+testing what it claims to test.
+
+The guard *detected* this and did not fail, because its only hard assertion
+about decoy validity was reading a hardcoded dict rather than the measurement —
+a check that could not fail. That is F42, now fixed and verified by reproducing
+the condition. **The full-tier scoreboard from a GitHub runner therefore carries
+an asterisk until the decoy is re-measured on that hardware.**
+
+**Group B — three cases where the parent edge alerted.** `null_traffic_ramp`,
+`user_cpu_saturation` and `payment_db_down` all surfaced
+`gateway-svc→order-svc`. That edge absorbs `order-svc`'s entire subtree by
+design — 735.0 in the specification test, because the gateway really did wait
+735 ms on order — and owns roughly 52% of the critical path in steady state.
+
+`null_traffic_ramp` is **F38**, already recorded open with the failure already
+reproduced: the detector cannot distinguish a latency rise caused by a
+regression from one caused by load. Every existing gate correctly declines to
+fire, and the fix needs a second EWMA over throughput plus a threshold — which
+cannot be chosen without an eval run, because that is M8.
+
+The other two are `docs/LIMITATIONS.md` caveat 7: nothing suppresses a parent
+whose rise is fully explained by a child's. Note that suppressing parents
+unconditionally would be wrong — `gateway_latency_cascade` is a case where the
+parent genuinely *is* the finding.
+
+**Group C — one co-alert.** `gateway_latency_cascade` found the right edge and
+also alerted on `order-svc→payment-svc`. Under the scoring rules that is
+correctly charged: an extra alert on an innocent edge costs the same on-call
 hour whether or not a correct alert accompanied it.
 
-So: **one known open defect, one structural gap, and a scoring rule doing its
-job.** Not five unrelated bugs.
+### So what does the 0.500 mean?
 
-### What was done about it
+Honestly: **less than it looks, and it is still not a pass.**
 
-Not a threshold change. Tuning to clear a gate is exactly what M8 forbids, and
-"precision was low so we lowered the floor" is indistinguishable from having no
-gate.
+Two of six failures are the harness being wrong about the host. Of the
+remaining four, one is a defect logged open before either run and three are one
+structural gap. Nothing in either run suggests the detector is missing
+incidents — recall is perfect twice over.
 
-Instead, **F41** — a genuine correctness defect found separately while the run
-was in flight. The assembler was filling per-call rows from a map keyed by
-service pair, so a retry or the saga's compensation gave every call on an edge
-the pair total. Measured on live data: 4.83% of `order-svc→payment-svc` rows
-carried `critical_ms > duration_ms`, which is definitionally impossible. Since
-`crit_p99` is what the detector alerts on and the map ranks by, that inflation
-plausibly contributes to several of the failures above — including the decoy.
+But the number stands as measured. It is not adjusted for the harness defect,
+because adjusting a score for a fault you found in your own measurement
+apparatus is exactly how a scoreboard stops meaning anything. The fix is to
+repair the harness and re-measure, in that order.
 
-The set is being re-run against the fix. **Whatever it reports will be recorded
-here, passing or not.** A baseline will be committed from a green run and from
+### What is not being done about it
+
+**No threshold has been moved.** Tuning to clear a gate is what M8 forbids, and
+"precision was low, so we lowered the floor" is indistinguishable from having no
+gate at all. `eval/baselines/main-full.json` remains **absent**, and
+`check_regression.py` continues to exit 2, which is the designed behaviour for
+"not yet measured". A baseline will be committed from a green run and from
 nothing else.
+
+### The order of work this implies
+
+1. **F42 is fixed** — the decoy invariant is measured and hard, so a run whose
+   traps are invalid now stops instead of producing a scoreboard.
+2. **Re-measure `CRIT_P99_BASELINE_MS` on the runner** and choose the decoy from
+   that measurement. It must be a measurement, not a choice — this is the third
+   time this application has moved its decoy (F30, F37, F42).
+3. **Then** re-run the set, and only then is a precision figure worth arguing
+   about.
+4. Parent suppression and F38 come after that, each justified by its own run.

@@ -30,13 +30,21 @@ by design.
 > detector, deploy attribution, a twelve-case eval harness, per-edge SLOs and a
 > cost meter.
 >
-> Three things are honestly open, and each links to where it is written up:
-> the **eval gate is currently red** (precision 0.583 against a 0.870 floor —
-> [`docs/EVAL.md §9`](docs/EVAL.md) has the run, the diagnosis and why the fix
-> is not to move the floor); the **live URL is not deployed**; and the **demo
-> video is not recorded** ([`docs/DEMO.md`](docs/DEMO.md) is the script it
-> follows). Forty-one defects are logged in
-> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), three of them found in
+> Three things are honestly open, and each links to where it is written up.
+>
+> The **eval gate is red** — precision 0.500 over two full twelve-case runs on
+> CI, against a 0.870 floor. Recall is 1.000 in both, with zero false negatives
+> across twenty-four case executions, and MTTD p95 is stable at 213/214 s
+> against a 432 s ceiling. Two of the six failures turned out to be the
+> *harness* being wrong about the host rather than the detector being wrong
+> (**F42**), which is written up in [`docs/EVAL.md §9`](docs/EVAL.md) along with
+> why the fix is to repair the measurement and re-run, not to move the floor.
+>
+> The **live URL is not deployed**, and the **demo video is not recorded**
+> ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
+>
+> Forty-two defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), four of them found in
 > Phase 8 by running the system rather than reading it.
 
 ---
