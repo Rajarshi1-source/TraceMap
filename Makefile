@@ -7,7 +7,7 @@ COMPOSE := docker compose
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev-local)
 export GIT_SHA
 
-.PHONY: help env up down demo seed logs ps smoke test skills skills-check fanout-guard probe-guard clean \n        eval eval-smoke eval-case eval-up eval-down eval-gate-guard eval-baseline \n        eval-check eval-tests topology-guard \n        helm-guard monitoring
+.PHONY: help env up down demo seed logs ps smoke test skills skills-check fanout-guard probe-guard clean \n        eval eval-smoke eval-case eval-up eval-down eval-gate-guard eval-baseline \n        eval-check eval-tests topology-guard manifest-guard \n        helm-guard monitoring
 
 help: ## Show this help
 	@echo ""
@@ -75,7 +75,7 @@ critical-path-guard: ## Phase 4 - the flagship: parallel siblings score 0, payme
 api-guard: ## Phase 5 - assert the graph API contract and latency budget
 	@python scripts/api-guard.py
 
-guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard api-guard eval-gate-guard ## Run every invariant guard
+guards: fanout-guard probe-guard trace-guard schema-guard critical-path-guard api-guard eval-gate-guard manifest-guard ## Run every invariant guard
 
 # ---------------------------------------------------------------- Phase 7
 #
@@ -121,6 +121,9 @@ eval-gate-guard: ## Exit criterion 5 - prove the gate goes red on a broken detec
 
 eval-tests: ## Fast offline checks: the case files, the scorer, the gate
 	@python -m pytest eval/tests -q -c eval/pytest.ini --rootdir=.
+
+manifest-guard: ## M10/M18 - no Jaeger v1 manifests, no EOL base images
+	@python scripts/manifest-guard.py
 
 topology-guard: ## Assert the declared service graph still matches the live one
 	@python scripts/topology-guard.py

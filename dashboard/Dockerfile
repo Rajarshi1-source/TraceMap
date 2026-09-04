@@ -1,8 +1,12 @@
 # Node.js 24 LTS (M18). Next.js 16.3 with standalone output.
 FROM node:24-alpine AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# package*.json, not package.json: `npm ci` needs the lockfile in the build
+# context and fails outright without it.
+COPY package*.json ./
+# See the microservices Dockerfiles: install drifts off the lockfile, ci does
+# not, and the lockfile is what the audit ran against.
+RUN npm ci --no-audit --no-fund
 
 FROM node:24-alpine AS build
 WORKDIR /app
@@ -12,6 +16,8 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 FROM node:24-alpine AS runtime
+# OS security fixes published since the base tag was cut (see gateway).
+RUN apk upgrade --no-cache
 WORKDIR /app
 RUN addgroup -S app && adduser -S app -G app
 # HOSTNAME=0.0.0.0 is NOT optional. Next's standalone server.js binds to

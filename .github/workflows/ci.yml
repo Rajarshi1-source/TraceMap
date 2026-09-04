@@ -114,22 +114,14 @@ jobs:
         run: python scripts/eval-gate-guard.py
       - name: skill archives are not stale
         run: python scripts/build-skills.py --check
-      - name: no Jaeger v1 manifests (M10)
-        # v1 has been EOL since 31 Dec 2025. A v1 manifest in this repo would
-        # be quoted at some point, and quoting it is disqualifying.
-        run: |
-          if grep -rIl --exclude-dir=.git --exclude=*.md \
-               -e 'jaegertracing/all-in-one' \
-               -e 'apiVersion: jaegertracing.io/v1' . ; then
-            echo "::error::Jaeger v1 manifest found (M10)"; exit 1
-          fi
-      - name: no EOL base images (M18)
-        # Node 20 went EOL in April 2026.
-        run: |
-          if grep -rIn --include=Dockerfile --include=*.yml --include=*.yaml \
-               -e 'node:20' -e 'node:18' -e 'python:3.9' . ; then
-            echo "::error::EOL base image found (M18)"; exit 1
-          fi
+      - name: M10 and M18 manifest invariants
+        # Was two inline greps, and a grep for a forbidden string is itself a
+        # file containing that string -- the M10 check matched the workflow
+        # that defined it and failed on a clean tree. F11 recorded the same
+        # self-matching shape against the Phase 3 criterion grep, so this is
+        # the second time it has bitten. A script can exclude itself and skip
+        # the comment that explains the rule; an inline pattern cannot.
+        run: python scripts/manifest-guard.py
 
   # ------------------------------------------------------------------- build
   build:
