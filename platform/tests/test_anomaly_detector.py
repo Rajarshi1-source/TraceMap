@@ -423,3 +423,105 @@ async def test_error_and_latency_alerts_do_not_suppress_each_other():
 
     assert latency_fired is not None and error_fired is not None
     assert {latency_fired.metric, error_fired.metric} == {"critical_p99", "error_rate"}
+
+
+# ===========================================================================
+# F37 - blame share. A p99 says how slow; it does not say whether it mattered.
+# ===========================================================================
+#
+# The decoy case failed twice before this gate existed, and both times the
+# detector was doing exactly what it was told. An edge is off the critical path
+# AT p99 only if it fails to finish last on more than 99% of traces, and
+# fan-out finish order has real variance -- so injecting enough delay to breach
+# a wall-clock threshold also pushes a sibling's last-finisher rate toward 1%.
+# Measured live: user-svc went from a critical p99 of exactly 0.0 to 135.4ms
+# while owning 0.02% of the critical path, and the detector alerted on it.
+def blame_obs(crit: float, share: float, *, requests: int = 500):
+    return EdgeObservation(
+        source="a", target="b",
+        critical_p99_ms=crit,
+        wall_p99_ms=crit,
+        request_count=requests,
+        blame_share=share,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_negligible_edge_never_alerts_however_slow_its_p99():
+    """The decoy, in a unit test.
+
+    user-svc's real numbers: baseline critical p99 0.0, faulted 135.4ms, blame
+    share 0.0002. Removing this edge entirely would not be noticed, so blaming
+    it for a user-visible regression is wrong no matter what the percentile says.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(10):
+        await d.evaluate(blame_obs(0.0, 0.0002))
+
+    fired = None
+    for _ in range(6):
+        fired = await d.evaluate(blame_obs(135.4, 0.0002)) or fired
+
+    assert fired is None, (
+        "alerted on an edge owning 0.02% of the critical path -- this is F37, "
+        "and it is the failure the decoy case exists to catch")
+
+
+@pytest.mark.asyncio
+async def test_the_culprit_still_alerts():
+    """The other half. A gate that suppresses everything is not a fix.
+
+    payment-svc under the same decoy: blame share 0.434.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(10):
+        await d.evaluate(blame_obs(155.0, 0.434))
+
+    fired = None
+    for _ in range(6):
+        fired = await d.evaluate(blame_obs(300.0, 0.434)) or fired
+
+    assert fired is not None, "the edge that actually owns the critical path must alert"
+    assert fired.delta_ms > 50
+
+
+@pytest.mark.asyncio
+async def test_blame_gate_does_not_touch_the_baseline():
+    """M6 is unchanged by F37.
+
+    The gate sits AFTER the sustained window and before dedup, so it can only
+    suppress an alert -- it must never alter what the baseline learns. If a
+    suppressed edge later becomes genuinely critical, its baseline has to still
+    be the healthy one, or the fix would have introduced a boiling frog of its
+    own.
+    """
+    r = FakeRedis()
+    d = AnomalyDetector(r)
+    for _ in range(10):
+        await d.evaluate(blame_obs(100.0, 0.001))
+    before = float(await r.get("baseline:edge:a:b:cp99"))
+
+    for _ in range(10):
+        await d.evaluate(blame_obs(400.0, 0.001))
+    after = float(await r.get("baseline:edge:a:b:cp99"))
+
+    assert after == before, (
+        "the blame gate changed what the baseline learned; it must only "
+        "suppress the alert (M6)")
+
+
+@pytest.mark.asyncio
+async def test_an_observation_without_blame_share_is_not_suppressed():
+    """A missing signal must not look like an innocent edge.
+
+    `blame_share` defaults to 1.0 so any caller that has not been updated keeps
+    alerting rather than silently going quiet -- the failure mode that is
+    hardest to notice is the one where the detector stops talking.
+    """
+    d = AnomalyDetector(FakeRedis())
+    for _ in range(10):
+        await d.evaluate(obs(100.0))
+    fired = None
+    for _ in range(6):
+        fired = await d.evaluate(obs(300.0)) or fired
+    assert fired is not None

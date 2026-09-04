@@ -274,7 +274,7 @@ a 405 is not an answer — it was being read as clean. Both halves fixed: the
 handler exists, and the sweep now treats any non-200 as *unaudited* rather than
 *clear*.
 
-### The decoy case is red, and stays red
+### The decoy case was red, and the detector was the thing that was wrong
 
 The flagship case does not pass, and the reason is the most interesting thing
 the phase produced.
@@ -301,12 +301,35 @@ path. The case's assertion is what is ill-posed. The right question is about
 percentile crossing a millisecond threshold: an edge owning 0.6% of the
 critical path is not the cause of anything whatever its p99 says.
 
-It is left red deliberately. The case was already rebuilt once on a
-measurement; rebuilding it a third time until it agreed would be tuning the
-measurement to the answer, which is the failure this document spends most of
-its length arguing against. The smoke tier therefore scores **precision 0.750
-against a 0.870 floor** and the gate is red, which is the honest state to
-commit at the end of a phase about not fudging exactly this.
+The case was not rebuilt a third time. Rebuilding it until it agreed would be
+tuning the measurement to the answer, which is the failure this document spends
+most of its length arguing against. The case was right; the detector was
+answering the wrong question, so the detector changed.
+
+**Gate 6: blame share.** A latency alert is now suppressed unless the edge owns
+at least 5% of the bucket's critical path. The signal needed no new plumbing --
+`service_edges_1m` has carried `crit_ms_sum` since Phase 3, so blame share is
+that over the bucket total.
+
+5% is a floor rather than a tuning knob, and the measured shares are why:
+`gateway-svc->order-svc` 52%, `order-svc->payment-svc` 43%,
+`order-svc->product-svc` 4.2%, `order-svc->user-svc` **0.02%**. Below a
+twentieth of the critical path an edge cannot be the cause of a user-visible
+regression by construction -- if deleting it entirely would go unnoticed, it is
+not what made anyone wait.
+
+Two details carry more weight than the threshold.
+
+The gate sits **after** the sustained window and **before** dedup, so the EWMA,
+the M6 healthy-only learning and the breach history are untouched. It can only
+suppress an alert, never change what the baseline learns. Closing a
+false-positive by introducing a boiling frog would be a poor trade, and a test
+pins it.
+
+And `blame_share` defaults to **1.0**, so a caller that has not been updated
+keeps alerting rather than going quiet. A missing signal must not look like an
+innocent edge; the failure mode hardest to notice is the detector that stops
+talking.
 
 ### An incomplete run is not a measurement
 

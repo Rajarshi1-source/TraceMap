@@ -89,7 +89,12 @@ SELECT
     sum(request_count)                          AS requests,
     sum(error_count)                            AS errors,
     quantileTDigestMerge(0.99)(wall_p99_state)  AS wall_p99,
-    quantileTDigestMerge(0.99)(crit_p99_state)  AS crit_p99
+    quantileTDigestMerge(0.99)(crit_p99_state)  AS crit_p99,
+    -- Total critical-path milliseconds this edge owns in the bucket. Divided
+    -- by the bucket's total below, it is the edge's BLAME SHARE, and F37 is
+    -- the reason the detector needs it: a p99 says how slow an edge was on its
+    -- worst 1% of traces, and says nothing about whether the edge mattered.
+    sum(crit_ms_sum)                            AS crit_ms_total
 FROM tracemap.service_edges_1m
 WHERE time_bucket >= now() - INTERVAL {window} MINUTE
   AND source_service = '{src}'
@@ -125,7 +130,12 @@ SELECT
     sum(error_count)                            AS errors,
     sum(error_count) / nullIf(sum(request_count), 0) AS error_rate,
     quantileTDigestMerge(0.99)(wall_p99_state)  AS wall_p99,
-    quantileTDigestMerge(0.99)(crit_p99_state)  AS crit_p99
+    quantileTDigestMerge(0.99)(crit_p99_state)  AS crit_p99,
+    -- Total critical-path milliseconds this edge owns in the bucket. Divided
+    -- by the bucket's total below, it is the edge's BLAME SHARE, and F37 is
+    -- the reason the detector needs it: a p99 says how slow an edge was on its
+    -- worst 1% of traces, and says nothing about whether the edge mattered.
+    sum(crit_ms_sum)                            AS crit_ms_total
 FROM tracemap.service_edges_1m
 WHERE time_bucket = (
     SELECT max(time_bucket) FROM tracemap.service_edges_1m
@@ -186,6 +196,13 @@ class QueryEngine:
     async def latest_bucket_edges(self) -> list[dict]:
         """Per-edge metrics for the newest minute-bucket. Detector input."""
         rows = await self.ch.query(Q_LATEST_BUCKET)
+
+        # Blame share is a property of the BUCKET, not of a row, so it is
+        # computed here across the edges the query returned rather than in SQL.
+        # Same single-table read either way; this keeps the window function out
+        # of a query the detector runs every cycle.
+        total_crit = sum(_f(r.get("crit_ms_total")) for r in rows)
+
         return [
             {
                 "source": r["source"],
@@ -195,6 +212,12 @@ class QueryEngine:
                 "errorRate": round(_f(r.get("error_rate")), 4),
                 "wallP99": round(_f(r.get("wall_p99")), 2),
                 "critP99": round(_f(r.get("crit_p99")), 2),
+                # 0.0 when the bucket carried no critical time at all, which is
+                # the honest answer: with nothing on the critical path, no edge
+                # owns a share of it.
+                "blameShare": round(
+                    _f(r.get("crit_ms_total")) / total_crit, 4
+                ) if total_crit > 0 else 0.0,
             }
             for r in rows
         ]

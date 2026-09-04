@@ -77,6 +77,7 @@ def config_from_env() -> DetectorConfig:
         # changes the thing being measured, and any eval score quoted afterwards
         # must say which value produced it.
         min_requests=int(os.environ.get("DETECTOR_MIN_REQUESTS", "100")),
+        min_blame_share=float(os.environ.get("DETECTOR_MIN_BLAME_SHARE", "0.05")),
         sustained_cycles=int(os.environ.get("DETECTOR_SUSTAINED_CYCLES", "3")),
         # The error path's only knob. Fixed rather than learned, because zero
         # is the target for errors in a way it never is for latency.
@@ -102,6 +103,7 @@ async def detect_once(engine: QueryEngine, detector: AnomalyDetector,
             wall_p99_ms=e["wallP99"],
             request_count=e["requestCount"],
             error_rate=e["errorRate"],
+            blame_share=e.get("blameShare", 1.0),
         )
         # Two independent questions about the same edge, each with its own
         # history and dedup keys. An edge can be slow, failing, or both, and
@@ -209,10 +211,10 @@ async def main() -> None:
     # run; this is so the config is legible from a container's first ten lines
     # rather than only from a database.
     log.info("detector armed: alpha=%.2f threshold=%.0fms min_requests=%d "
-             "sustained=%d/%d error_rate>%.1f%%",
+             "sustained=%d/%d error_rate>%.1f%% blame_share>=%.0f%%",
              cfg.alpha, cfg.threshold_ms, cfg.min_requests,
              cfg.sustained_cycles, cfg.sustained_window,
-             cfg.error_rate_threshold * 100)
+             cfg.error_rate_threshold * 100, cfg.min_blame_share * 100)
 
     await run_forever(
         "anomaly_detector",

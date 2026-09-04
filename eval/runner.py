@@ -525,7 +525,7 @@ def detector_config() -> dict:
     """
     keys = ("DETECTOR_ALPHA", "DETECTOR_THRESHOLD_MS", "DETECTOR_MIN_REQUESTS",
             "DETECTOR_SUSTAINED_CYCLES", "DETECTOR_WARMUP_CYCLES",
-            "DETECTOR_ERROR_RATE_THRESHOLD",
+            "DETECTOR_ERROR_RATE_THRESHOLD", "DETECTOR_MIN_BLAME_SHARE",
             "DETECT_INTERVAL_S", "ASSEMBLE_INTERVAL_S", "LATE_SPAN_GRACE_S")
     return {k.lower(): os.environ[k] for k in keys if os.environ.get(k)}
 

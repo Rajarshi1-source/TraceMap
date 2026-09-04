@@ -170,6 +170,9 @@ workers:
       # Fixed rather than learned: zero is the target for errors in a way it
       # never is for latency.
       errorRateThreshold: "0.02"
+      # F37: blame-share floor. A p99 says how slow an edge was, not
+      # whether it mattered.
+      minBlameShare: "0.05"
       warmupCycles: "5"
       intervalS: "60"
     # M20. The dangerous feature ships OFF, behind a confidence floor, a rate

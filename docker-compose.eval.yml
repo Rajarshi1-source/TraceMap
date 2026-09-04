@@ -33,6 +33,9 @@ services:
       # for latency, so an EWMA here would make a persistently broken service
       # read as healthy. 2% against a measured healthy floor of ~0.08%.
       DETECTOR_ERROR_RATE_THRESHOLD: "0.02"
+      # F37. An edge owning under 5% of the critical path cannot be the
+      # cause of a user-visible regression, whatever its p99 says.
+      DETECTOR_MIN_BLAME_SHARE: "0.05"
       DETECTOR_WARMUP_CYCLES: "5"
       DETECT_INTERVAL_S: "60"
       # Alerts must not leave the machine during an eval run. Twelve injected

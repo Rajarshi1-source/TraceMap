@@ -287,6 +287,8 @@ spec:
               value: {{ $w.config.sustainedCycles | quote }}
             - name: DETECTOR_ERROR_RATE_THRESHOLD
               value: {{ $w.config.errorRateThreshold | quote }}
+            - name: DETECTOR_MIN_BLAME_SHARE
+              value: {{ $w.config.minBlameShare | quote }}
             - name: DETECTOR_WARMUP_CYCLES
               value: {{ $w.config.warmupCycles | quote }}
             - name: DETECT_INTERVAL_S

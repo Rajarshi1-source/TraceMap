@@ -27,7 +27,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
 | **5 — API + dashboard** | ✅ **Done** | 7/7 verified; toggle fades the parallel edge, positions drift 1.14px across polls |
 | **6 — Detector + deploy attribution** | ✅ **Done** | 7/7 verified live; 60ms fault alerted at **375s** — see F19 on the budget |
-| **7 — Eval harness + CI ⭐** | ⚠️ **Built, not complete** | 2/8 criteria clean, 3 partial, 3 unmet. Smoke tier: **precision 0.750 / recall 1.000 / F1 0.857, MTTD p50 242s p95 273s** — **decoy fails (F37, open)**. **8 of 12 cases have never run live.** CI green after three rounds of fixes; **live URL not deployed**; no baseline committed (F36) |
+| **7 — Eval harness + CI ⭐** | ⚠️ **Built, not complete** | 2/8 criteria clean, 3 partial, 3 unmet. **F37 fixed** (blame-share gate); **F38 open** — 002 failed on its first-ever run. Full set attempted and **abandoned at 4/12 on host stalls (F36)**, so criteria 1/3 stay open. CI 14/14 green; **live URL not deployed**; no baseline committed |
 | 8 — Docs + polish | Not started | |
 
 Phase 1 measured: **19.67 req/s, 0.08% error rate, p95 128ms**. Checkout p95 sits
@@ -700,7 +700,7 @@ nobody should trust.
 
 ## 2h. Found while building (Phase 7)
 
-Fifteen findings. **Eleven in the harness, one in the detector, two in the environment it needs, and one still open** — which is the
+Sixteen findings. **Eleven in the harness, two in the detector, two in the environment it needs, and one still open (F38)** — which is the
 phase working as intended. An eval suite that has never failed is evidence of
 an untested harness, not of a working detector, and four of these were found by
 the harness scoring a correct detector as broken.
@@ -1062,7 +1062,7 @@ the numbers it produced here are not publishable.** Reporting a measurement the
 environment could not support is the failure the whole phase exists to prevent,
 and it would be a strange thing to commit at the end of it.
 
-### F37 — 🔴 A p99 decoy trap is unsatisfiable for any delay large enough to matter — OPEN
+### F37 — 🔴 A p99 decoy trap is unsatisfiable for any delay large enough to matter — FIXED
 
 The decoy case was rebuilt once already (F30) on a measurement, and it failed
 again on the clean run. The second failure has a different and more general
@@ -1106,24 +1106,100 @@ decoy attempt sat exactly where they cross.
 critical path. The case's assertion is what is wrong: *"the decoy edge must
 never alert"* is not a well-posed question about a p99.
 
-**Deliberately not fixed.** Rebuilding the case a third time to reach green
-would be tuning the measurement until it gives the desired answer, which is the
-M8/M9 failure this entire phase exists to prevent. Recorded as open, with the
-number attached, which is the honest position: the smoke tier scores
-**precision 0.750 against a 0.870 floor** and the gate is red because of it.
+**The case was not rebuilt.** Rebuilding it a third time to reach green would
+be tuning the measurement until it gives the desired answer, which is the M8/M9
+failure this phase exists to prevent. The case is correct; the *detector* was
+answering the wrong question.
 
-**What the fix looks like, for whoever picks this up.** The right assertion is
-about *blame share* rather than a percentile crossing a millisecond threshold —
-`blameShare` already exists on every edge in the graph API. An edge that owns
-0.6% of the critical path is not the cause of anything, whatever its p99 says.
-That would also be a real improvement to the detector rather than only to the
-harness, and it would be justified by an eval number, which is the bar M8 sets.
+**The fix: a blame-share gate.** A p99 answers "how slow was this edge on its
+worst 1% of traces". It does not answer "did this edge matter". The detector
+now requires an edge to own at least **5% of the bucket's critical path**
+before a latency alert about it is allowed out.
+
+The signal was already there. `service_edges_1m` has carried `crit_ms_sum`
+since Phase 3, so blame share is that divided by the bucket total — no schema
+change, one extra column in the detector's query, and the arithmetic done in
+Python across the edges the query already returns.
+
+Measured shares on this application, which is what makes 5% a floor rather
+than a tuning knob:
+
+| edge | blame share |
+|---|---|
+| `gateway-svc->order-svc` | 52% |
+| `order-svc->payment-svc` | 43% |
+| `order-svc->product-svc` | 4.2% |
+| `order-svc->user-svc` | **0.02%** |
+
+The detector was alerting on an edge owning **two hundredths of one percent**
+of the critical path. Below 5%, an edge cannot be the cause of a user-visible
+regression by construction: if removing it entirely would not be noticed, it is
+not what made the customer wait.
+
+**Where the gate sits matters as much as the threshold.** It is placed after
+the sustained window and before dedup, so the EWMA, the M6 healthy-only
+learning and the breach history are all byte-for-byte unchanged. The gate can
+only suppress an alert; it can never alter what the baseline learns. A fix that
+introduced a boiling frog of its own while closing a false-positive would be a
+poor trade, and `test_blame_gate_does_not_touch_the_baseline` pins it.
+
+`blame_share` defaults to **1.0** on `EdgeObservation`, so any caller that has
+not been updated keeps alerting rather than silently going quiet. A missing
+signal must never look like an innocent edge — the failure mode hardest to
+notice is the one where the detector stops talking.
+
+Four tests cover it: the decoy suppressed at its real 0.0002 share, the culprit
+still alerting at 0.434, the baseline unchanged, and the default not
+suppressing.
 
 The pair F30 and F37 together are worth more than either alone. The first says
 a service that already carries blame cannot be a decoy. The second says that
 under a percentile, *no* service is reliably a decoy once you slow it enough to
 matter. Between them they are a fairly complete account of why the "parallel
 sibling" case is harder than it looks.
+
+### F38 — 🔴 The detector cannot tell a traffic ramp from a regression — OPEN
+
+`002_null_traffic_ramp` ran for the first time in the project's history and
+**failed on its first execution**: with no fault injected anywhere, the
+detector alerted on `gateway-svc->order-svc` while offered load doubled.
+
+This is the case working. Load raises latency legitimately — queueing is real,
+and p99 moves under a 2x ramp without anything being wrong. A detector that
+reads that as a regression pages somebody every time marketing sends an email,
+and alert fatigue is a human availability problem rather than a cosmetic one.
+
+**Why the existing gates do not catch it.** Every one of them is aimed at a
+different failure:
+
+| Gate | Why it does not fire |
+|---|---|
+| request-count floor | traffic went *up*; the floor is a minimum |
+| warmup | the baseline was long since armed |
+| M6 healthy-only learning | correct, and irrelevant — the rise is real |
+| sustained 3-in-5 | the ramp is sustained, which is the point |
+| blame share (F37) | `gateway-svc->order-svc` owns 52% of the critical path. It genuinely IS the bottleneck; it is simply not a DEFECT |
+
+F37 and F38 are a matched pair and worth reading together. F37 was an edge that
+was slow and did not matter. F38 is an edge that is slow, does matter, and is
+still not something to wake anyone for. Blame share answers the first question
+and says nothing about the second.
+
+**What the fix looks like.** The signal the detector is missing is load itself.
+`request_count` is already in every observation and already in the roll-up; the
+detector reads it only as a floor. A regression is a latency rise *at constant
+or falling throughput*; a ramp is a latency rise *with* throughput. Normalising
+the breach against the change in request count — or simply suppressing while
+throughput is climbing sharply — is the shape of it.
+
+**Deliberately not fixed in this pass.** F37 was fixed because the measurement
+said the detector was answering the wrong question and the fix was one gate
+with a measured floor behind it. F38 needs a second EWMA over throughput and a
+decision about what "sharply" means, and choosing that number without an eval
+run to justify it is M8. The case that measures it exists and now runs; the
+number comes first, then the threshold.
+
+Recorded open, with the failure reproduced, which is the honest position.
 
 ---
 

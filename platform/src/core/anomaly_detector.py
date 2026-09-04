@@ -77,6 +77,26 @@ class DetectorConfig:
     # this does not fire on the ordinary failures every system has.
     error_rate_threshold: float = 0.02
 
+    # F37. The minimum share of the bucket's critical path an edge must own
+    # before a latency alert about it is allowed out.
+    #
+    # A p99 answers "how slow was this edge on its worst 1% of traces". It does
+    # NOT answer "did this edge matter", and at the tail those come apart. An
+    # edge is off the critical path at p99 only if it fails to finish last on
+    # more than 99% of traces, and fan-out finish order has real variance -- so
+    # injecting enough delay to breach a wall-clock threshold also pushes a
+    # sibling's last-finisher rate toward 1%. Measured: user-svc went from a
+    # critical p99 of exactly 0.0 to 135.4ms at a 0.6% last-finisher rate, and
+    # the detector alerted on an edge owning 0.02% of the critical path.
+    #
+    # 5% is not tuned to the golden set. It is the point below which an edge
+    # cannot be the cause of a user-visible regression by construction: if it
+    # owns a twentieth of the critical path, removing it entirely would not be
+    # noticed. Measured shares on this application, for scale --
+    #   gateway-svc->order-svc   52%     order-svc->payment-svc  43%
+    #   order-svc->product-svc  4.2%     order-svc->user-svc   0.02%
+    min_blame_share: float = 0.05
+
 
 @dataclass(frozen=True)
 class EdgeObservation:
@@ -86,6 +106,10 @@ class EdgeObservation:
     wall_p99_ms: float
     request_count: int
     error_rate: float = 0.0
+    # Fraction of the bucket's total critical-path time this edge owns.
+    # Defaults to 1.0 so a caller that does not supply it is never silently
+    # suppressed -- an omitted signal must not look like an innocent edge.
+    blame_share: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -208,7 +232,25 @@ class AnomalyDetector:
             return None
         n = recent
 
-        # --- Gate 6: dedup --------------------------------------------------
+        # --- Gate 6: blame share (F37) --------------------------------------
+        #
+        # Placed HERE, after the sustained window and before dedup, on purpose.
+        # Everything above -- the EWMA, the M6 healthy-only learning, the
+        # breach history -- is untouched, so this cannot change what the
+        # baseline learns. It only decides whether a confirmed breach is worth
+        # anyone's attention.
+        #
+        # Without it the detector blames whatever the percentile points at,
+        # including an edge that owns 0.02% of the critical path and whose
+        # removal nobody would notice.
+        if obs.blame_share < cfg.min_blame_share:
+            log.info("edge %s->%s breached (+%.1fms) but owns %.2f%% of the "
+                     "critical path (floor %.0f%%) - not the cause",
+                     s, t, delta, obs.blame_share * 100,
+                     cfg.min_blame_share * 100)
+            return None
+
+        # --- Gate 7: dedup --------------------------------------------------
         # SET NX EX is atomic: with N detector replicas exactly one wins and
         # Slack gets one message instead of N.
         won = await self.redis.set(self._k_dedup(s, t), "1",
