@@ -130,6 +130,31 @@ async def stream_alerts(request: Request):
                                       "X-Accel-Buffering": "no"})
 
 
+@router.get("/api/slo")
+async def get_slo(request: Request):
+    """D6 - error budgets on CRITICAL-PATH latency, per dependency edge.
+
+    The one endpoint here that makes a claim no other tool makes: an edge can
+    be 700ms of wall clock and burn zero budget, because those 700ms ran
+    alongside a slower sibling and cost the user nothing. Each row carries
+    `wallClockBad` next to `sli` so the contrast is visible rather than
+    asserted.
+    """
+    return await request.app.state.slo.evaluate()
+
+
+@router.get("/api/cost")
+async def get_cost(request: Request):
+    """D5 - the monthly bill, from ClickHouse's own accounting.
+
+    Every figure is labelled by how it was obtained: bytes per row are measured
+    from system.parts, steady state is projected, prices are configuration. A
+    cost model that does not say which of its numbers were observed is a
+    spreadsheet with extra steps.
+    """
+    return await request.app.state.cost.report()
+
+
 @router.get("/healthz")
 async def healthz():
     """Process liveness ONLY - no dependency checks (M17)."""

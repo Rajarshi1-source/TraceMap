@@ -17,6 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.eval_metrics import router as eval_router
 from src.api.routes import router
 from src.cache.redis_cache import Cache
+from src.core.cost_meter import CostMeter
+from src.core.edge_slo import EdgeSLOEvaluator
 from src.core.query_engine import QueryEngine
 from src.integrations.clickhouse_client import ClickHouseClient
 from src.integrations.postgres_client import PostgresClient
@@ -35,6 +37,11 @@ async def lifespan(app: FastAPI):
     app.state.ch = ClickHouseClient()
     app.state.cache = Cache()
     app.state.engine = QueryEngine(app.state.ch)
+    # D5 and D6. Both are stateless readers over the same ClickHouse
+    # connection -- neither owns a client, a cache or a background task,
+    # which is why two stretch features cost one line each here.
+    app.state.cost = CostMeter(app.state.ch)
+    app.state.slo = EdgeSLOEvaluator(app.state.ch)
     app.state.pg = await PostgresClient.connect()
     yield
     if app.state.pg is not None:

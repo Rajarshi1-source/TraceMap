@@ -229,3 +229,119 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "No eval run in 36 hours - the gate is not gating"
+
+  # ------------------------------------------------------------------------
+  # D6: error budgets on CRITICAL-PATH latency, per dependency edge.
+  #
+  # Same multi-window multi-burn-rate policy as CheckoutErrorBudgetFastBurn,
+  # deliberately: one burn-rate policy, applied at two altitudes. The checkout
+  # SLO says the product is broken; these say which edge is breaking it, and
+  # they say it in error-budget terms rather than as a latency threshold.
+  #
+  # WHAT MAKES THESE DIFFERENT FROM EVERY OTHER EDGE LATENCY ALERT. The SLI is
+  # computed over `critical_ms`, not wall clock. A parallel sibling running for
+  # 700ms next to a 720ms sibling burns NO budget here, because it cost the
+  # user nothing -- and the wall-clock ratio it would have burnt is exported
+  # alongside as tracemap_edge_wallclock_bad_ratio so the difference can be
+  # graphed. That series is evidence. It is never alerted on, and the moment
+  # someone writes an alert against it this whole design has been undone.
+  #
+  # These series are ABSENT rather than zero when an edge is below the
+  # 100-request floor, so `absent`-driven silence is the correct behaviour on
+  # an idle stack and no `> 0` guard is needed.
+  # ------------------------------------------------------------------------
+  - name: tracemap-edge-slo
+    rules:
+      - alert: EdgeCriticalPathBudgetFastBurn
+        # 14.4x for two minutes on BOTH windows: 2% of a 30-day budget in an
+        # hour. The long window proves the burn is real, the short one proves
+        # it is still happening.
+        expr: |
+          tracemap_edge_slo_burn_rate{window="1h"} > 14.4
+          and on(edge)
+          tracemap_edge_slo_burn_rate{window="5m"} > 14.4
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: >
+            {{ $labels.edge }} is burning its critical-path budget 14.4x
+          description: >
+            This edge is contributing user-visible latency beyond its
+            objective, at a rate that consumes 2% of the 30-day budget in an
+            hour. The measurement is critical-path milliseconds, so this is
+            not "the call is slow" -- it is "the call is slow AND the user is
+            waiting for it". Check /api/slo for the wall-clock counterfactual
+            before concluding the service itself regressed.
+
+      - alert: EdgeCriticalPathBudgetSlowBurn
+        # 6x over six hours. Not a page: nothing is on fire, but at this rate
+        # the month's budget is gone before the month is.
+        expr: |
+          avg_over_time(tracemap_edge_slo_burn_rate{window="1h"}[6h]) > 6
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.edge }} is burning critical-path budget 6x"
+          description: >
+            Sustained 6x burn exhausts a 30-day budget in five days. This is
+            the degradation the fast-burn alert is designed NOT to catch --
+            slow enough to look like weather, fast enough to matter.
+
+      - alert: EdgeErrorBudgetExhausted
+        # Stated as a state, not a rate. Budget remaining is the number that
+        # decides whether to ship, and it deserves its own alert rather than
+        # being inferred from a burn rate.
+        expr: tracemap_edge_slo_budget_remaining < 0
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.edge }} has spent its 30-day critical-path budget"
+          description: >
+            Budget remaining {{ $value | printf "%.2f" }}. The policy this
+            implies -- freeze risky changes on the owning service until the
+            window rolls -- is a decision for a human; this alert only makes
+            the number impossible to miss.
+
+  # ------------------------------------------------------------------------
+  # D5: the cost meter, alerted only where cost turns into an outage.
+  #
+  # There is deliberately NO alert on the monthly euro figure. It contains a
+  # projection, projections drift, and paging someone because a forecast moved
+  # is how a cost dashboard gets muted. Disk filling up is a different thing:
+  # it is measured, and it ends with ClickHouse refusing writes.
+  # ------------------------------------------------------------------------
+  - name: tracemap-cost
+    rules:
+      - record: job:storage_on_disk_bytes:total
+        expr: sum(tracemap_storage_on_disk_bytes)
+
+      - alert: StorageGrowthOffProjection
+        # Bytes per row is the one number the whole cost model rests on. If it
+        # moves by half, either the codecs stopped applying or the span shape
+        # changed -- and every retention decision made from the old figure is
+        # now wrong.
+        expr: |
+          tracemap_storage_bytes_per_row{table="spans"}
+            > 1.5 * avg_over_time(tracemap_storage_bytes_per_row{table="spans"}[7d])
+        for: 2h
+        labels: { severity: ticket }
+        annotations:
+          summary: "Bytes per span is 50% above its weekly average"
+          description: >
+            Measured {{ $value | printf "%.1f" }} bytes/row. Check that the
+            per-column codecs still apply and that no high-cardinality
+            attribute started riding along on every span. Re-derive
+            docs/COST.md before quoting it again.
+
+      - alert: DiskProjectedToFill
+        # 80 GB is what CX32 ships with (D2). Crossing 70% of it means the
+        # steady-state projection and the box have stopped agreeing.
+        expr: job:storage_on_disk_bytes:total > 0.7 * 80 * 1024 * 1024 * 1024
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "ClickHouse is using more than 70% of the host disk"
+          description: >
+            The lever is the sampling rate, not the TTLs -- see docs/COST.md.
+            At 20% probabilistic baseline sampling the raw span table is the
+            only thing on this disk that scales with traffic.

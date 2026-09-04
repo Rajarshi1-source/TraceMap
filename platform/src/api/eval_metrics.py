@@ -180,6 +180,85 @@ async def metrics(request: Request) -> Response:
             # which is the correct way for this to fail.
             log.exception("could not read the eval scoreboard for /metrics")
 
+    # ---------------------------------------------------------------- D6
+    # Edge-level error budgets. These exist so the burn-rate alerting in
+    # prometheus-rules.yml has something to key off; the multi-window policy
+    # lives there rather than here, next to the checkout SLO it was modelled
+    # on, because two burn-rate policies in two systems drift apart.
+    #
+    # Cost: three ClickHouse aggregations per scrape, the widest being 30 days
+    # of a 1-minute roll-up over a handful of edges -- tens of thousands of
+    # rows, not millions. If the topology ever grows enough for that to matter,
+    # the fix is a recording worker, not a longer scrape interval.
+    slo = getattr(request.app.state, "slo", None)
+    if slo is not None:
+        try:
+            report = await slo.evaluate()
+            for e in report.get("edges", []):
+                lbl = f'{{edge="{e["edge"]}"}}'
+                gauge("tracemap_edge_slo_objective_ms",
+                      "Critical-path latency objective for this edge",
+                      e["objectiveMs"], lbl)
+                gauge("tracemap_edge_slo_target_ratio",
+                      "Fraction of requests that must meet the objective",
+                      e["targetRatio"], lbl)
+                # Absent, not zero, when there is too little traffic to form a
+                # ratio. A burn rate of 0 on an idle edge reads as perfect
+                # health, which is the failure this whole file argues against.
+                gauge("tracemap_edge_slo_sli",
+                      "Fraction of requests within the critical-path objective",
+                      e["sli"], lbl)
+                gauge("tracemap_edge_slo_budget_remaining",
+                      "Fraction of the 30-day error budget still unspent",
+                      e["budgetRemaining"], lbl)
+                gauge("tracemap_edge_slo_burn_rate",
+                      "Error budget burn rate over the long window",
+                      e["burnRateLong"], f'{{edge="{e["edge"]}",window="1h"}}')
+                gauge("tracemap_edge_slo_burn_rate",
+                      "Error budget burn rate over the short window",
+                      e["burnRateShort"], f'{{edge="{e["edge"]}",window="5m"}}')
+                # The counterfactual, exported so the contrast can be graphed
+                # rather than merely described. Never alerted on.
+                gauge("tracemap_edge_wallclock_bad_ratio",
+                      "Bad-event ratio the SAME edge would show under a "
+                      "wall-clock objective -- evidence, not an objective",
+                      e["wallClockBad"], lbl)
+        except Exception:
+            log.exception("could not evaluate edge SLOs for /metrics")
+
+    # ---------------------------------------------------------------- D5
+    # The cost meter. Storage bytes are what ClickHouse has actually written,
+    # so these series are a measurement; the monthly euro figure carries a
+    # projection inside it and is labelled as derived in /api/cost.
+    cost = getattr(request.app.state, "cost", None)
+    if cost is not None:
+        try:
+            rep = await cost.report()
+            for t in rep.get("measured", {}).get("tables", []):
+                lbl = f'{{table="{t["table"]}"}}'
+                gauge("tracemap_storage_on_disk_bytes",
+                      "Bytes on disk, from system.parts",
+                      int(t["onDiskGiB"] * (1024 ** 3)), lbl)
+                gauge("tracemap_storage_bytes_per_row",
+                      "Measured bytes on disk per row", t["bytesPerRow"], lbl)
+                gauge("tracemap_storage_compression_ratio",
+                      "Uncompressed over compressed", t["compressionRatio"], lbl)
+            c = rep.get("cost", {})
+            gauge("tracemap_cost_monthly_eur",
+                  "Projected monthly cost: host plus storage overflow",
+                  c.get("totalMonthlyEur"))
+            gauge("tracemap_cost_per_million_spans_eur",
+                  "Projected monthly cost per million spans ingested",
+                  c.get("eurPerMillionSpans"))
+            gauge("tracemap_cost_fixed_share",
+                  "Share of the bill that is the box rather than the data",
+                  c.get("fixedCostShare"))
+            gauge("tracemap_spans_per_day",
+                  "Measured span ingest rate, extrapolated to a day",
+                  rep.get("measured", {}).get("spansPerDay"))
+        except Exception:
+            log.exception("could not read the cost meter for /metrics")
+
     gauge("tracemap_api_up", "Analytics API is serving", 1)
     gauge("tracemap_api_scrape_timestamp_seconds",
           "Unix time this endpoint was scraped", time.time())

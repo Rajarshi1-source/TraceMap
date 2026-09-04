@@ -66,8 +66,23 @@ jobs:
       GIT_SHA: ${{ github.sha }}
       ANALYTICS_API: http://localhost:8090
       DEPLOY_CONTROL: http://localhost:9103
-      REDIS_URL: redis://localhost:6379/0
+      # F39: these were the compose defaults, and the overlay stopped using
+      # them. docker-compose.eval.yml republishes Redis on 56379 and Postgres
+      # on 55432 so a developer's native service cannot win the bind and be
+      # silently talked to instead of the container. CI has no native Redis, so
+      # the mismatch did not fail at boot -- the whole stack came up green and
+      # the runner died in preflight ten minutes later, which is exactly the
+      # cost of a config that is duplicated and not asserted.
+      #
+      # The literals are duplicated from the overlay because GitHub Actions
+      # cannot reference one env key from another in the same block. The drift
+      # guard is eval/tests/test_ci_ports.py, which fails if these stop
+      # agreeing -- the same bargain as cost_meter.RETENTION_DAYS.
+      EVAL_REDIS_PORT: "56379"
+      EVAL_POSTGRES_PORT: "55432"
+      REDIS_URL: redis://localhost:56379/0
       POSTGRES_HOST: localhost
+      POSTGRES_PORT: "55432"
     steps:
       - uses: actions/checkout@v4
 
