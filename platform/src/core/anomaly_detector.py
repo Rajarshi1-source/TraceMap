@@ -283,12 +283,32 @@ class AnomalyDetector:
             # ===============================================================
             if recent == 0:
                 await self._update_ewma(obs, baseline)
-                # M6 applies to dispersion exactly as it applies to the level.
-                # Learning |delta| from a breaching window would let a noisy
-                # fault raise its own bar until it stopped being detectable --
-                # the boiling frog, one derivative up, and harder to see
-                # because nothing about the baseline would look wrong.
-                await self._update_mad(obs, mad, abs(delta))
+
+            # Dispersion learns on ANY non-breaching observation, not only on an
+            # all-clean window, and the difference is deliberate.
+            #
+            # The level uses `recent == 0` because a sustained fault produces
+            # occasional sub-threshold cycles and letting each teach the
+            # baseline walks it onto the fault. Dispersion has the opposite
+            # exposure: the noisiest edges are precisely the ones whose windows
+            # are rarely all-clean, so gating MAD on `recent == 0` biases it
+            # DOWNWARD exactly where it is needed and can deadlock outright --
+            # an edge too jittery to get a clean window never learns that it is
+            # jittery, so its bar stays at the floor and F43 is not fixed for
+            # the only edges it was written for.
+            #
+            # Found by reading live Redis after the first fix: `product-svc` and
+            # `user-svc` had learned a noise floor and `gateway-svc->order-svc`
+            # and `order-svc->payment-svc` -- the two edges this is about -- had
+            # no MAD key at all.
+            #
+            # M6 still holds, because the sample is bounded: this branch only
+            # runs when `delta <= effective`, so a breaching value can never
+            # enter the estimate. That also makes it self-limiting rather than
+            # runaway -- MAD converges to the mean |delta| of samples below a
+            # bar that is itself 4x MAD, which has a fixed point at the edge's
+            # true jitter and no way to climb past it.
+            await self._update_mad(obs, mad, abs(delta))
             return None
 
         # --- Gate 5: sustained confirmation ---------------------------------

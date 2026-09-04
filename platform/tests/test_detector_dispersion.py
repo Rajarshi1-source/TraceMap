@@ -236,3 +236,55 @@ async def test_a_cold_edge_still_never_alerts_on_first_sight():
     """Gate 2 is untouched by any of this."""
     d, _ = detector()
     assert await d.evaluate(obs(500.0)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_noisy_edge_can_learn_its_noise_floor_without_a_clean_window():
+    """The bootstrapping deadlock, found in live Redis rather than in a test.
+
+    Gating dispersion on `recent == 0` -- an all-clean window, which is what
+    the LEVEL correctly requires -- biases it downward exactly where it matters
+    and can deadlock: an edge too jittery to ever get a clean window never
+    learns that it is jittery, so its bar stays at the floor and F43 is not
+    fixed for the only edges it was written for.
+
+    Observed after the first version of the fix: product-svc and user-svc had
+    learned a noise floor; gateway-svc->order-svc and order-svc->payment-svc,
+    the two edges this is about, had no MAD key at all.
+
+    Here the edge alternates a breaching spike with sub-threshold jitter, so no
+    five-cycle window is ever clean.
+    """
+    d, r = detector()
+    await arm(d, r, baseline=100.0, mad=0.0)
+
+    for i in range(30):
+        # A spike every third cycle keeps `recent` above zero throughout.
+        await d.evaluate(obs(100.0 + (400.0 if i % 3 == 0 else 35.0)))
+
+    assert float(r.store.get(d._k_mad("a", "b"), 0)) > 10.0, (
+        "the edge never learned its noise floor; the bar stays at the 50ms "
+        "floor and F43 is unfixed for exactly the edges it targets"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispersion_cannot_run_away():
+    """The bar is self-limiting, which is why learning outside a clean window
+    is safe.
+
+    MAD only ever samples deltas BELOW the current bar, and the bar is 4x MAD,
+    so the estimate converges on the edge's true jitter instead of ratcheting
+    upward until the edge is undetectable.
+    """
+    d, r = detector()
+    await arm(d, r, baseline=100.0, mad=0.0)
+
+    for i in range(200):
+        await d.evaluate(obs(100.0 + (30.0 if i % 2 else -30.0)))
+
+    mad = float(r.store[d._k_mad("a", "b")])
+    # True mean |deviation| is ~30ms; the estimate must settle near it rather
+    # than climb. A generous ceiling: anything approaching 4x would mean the
+    # bar had started feeding itself.
+    assert 15.0 < mad < 60.0, f"MAD settled at {mad}, outside its fixed point"
