@@ -702,7 +702,7 @@ nobody should trust.
 
 Twenty-one findings. **Eleven in the harness, three in the detector, two in the
 environment it needs, five found in Phase 8 by running the system rather than
-reading it, and two still open (F38, F43)** — which is the phase working as intended.
+reading it, and one still open (F38)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
 detector as broken.
@@ -722,7 +722,9 @@ different kind of exercise and none by a test:
   that had already gone red for what looked like a different reason.
 - **F43** — a flat 50ms threshold makes the largest-baseline edge the twitchiest,
   so it false-positives on a null case with nothing injected. Only became
-  legible once F42 was fixed and a run produced a trustworthy number.
+  legible once F42 was fixed and a run produced a trustworthy number; the fix
+  scales the bar by each edge's own dispersion, because scaling by baseline is
+  arithmetically impossible on the measured data.
 
 Three deserve reading even if the rest are skipped. **F28** is a gate a correct
 detector could never pass. **F30** is a decoy that punished the detector for
@@ -1489,7 +1491,7 @@ an asterisk, and `docs/EVAL.md` says so.
 
 ---
 
-### F43 — 🔴 A fixed absolute threshold makes the biggest edge the twitchiest — OPEN
+### F43 — 🔴 A fixed absolute threshold makes the biggest edge the twitchiest — FIXED
 
 Three full-set runs, the third with **provably valid traps**, and the same edge
 is the blamed one in four of six failures — including both null cases, one of
@@ -1547,24 +1549,72 @@ variability, with the absolute 50 ms retained as a floor so a fast edge cannot
 become hypersensitive. The EWMA already tracks the level; tracking dispersion
 alongside it is the natural shape.
 
-**Deliberately not fixed in this pass, and the reason is the same as F38.**
-Choosing between "proportional to baseline" and "multiple of observed sigma",
-and choosing the coefficient, cannot be done from an argument — that is M8, and
-M8 is the load-bearing claim of this whole phase. The case that measures it now
-runs, produces a trustworthy number, and records the topology it was measured
-against. The number comes first, then the threshold.
+**Fixed: the bar scales with each edge's own noise.**
 
-**Note what must not be done.** Raising 50 to 80 would clear several of these
-cases and is the wrong fix twice over: it makes the detector deafer on every
-edge to quieten one, and it is a threshold changed to clear a gate, which is the
-exact behaviour the eval set exists to prevent. A precision of 0.500 that is
-honestly reported is worth more than a 0.9 obtained that way.
+```python
+mad = ewma(|observed - baseline|)          # learned only on healthy windows
+effective = max(threshold_ms, mad_multiplier * mad)
+breached  = delta > effective
+```
 
-**Related.** F38 (load versus regression) and `docs/LIMITATIONS.md` caveat 7
-(parent edges echoing their children) are the other two explanations for
-`gateway-svc->order-svc` alerting, and all three are the same shape: an edge
-alerting when it should not. It is plausible that a baseline-relative threshold
-moves several of them at once. Plausible is not measured.
+`threshold_ms` becomes a **floor**. An edge with no jitter is exactly as
+sensitive as before; a jittery edge has to clear its own noise. Dispersion can
+only ever *raise* the bar, never lower it, so nothing becomes hypersensitive
+because its noise floor happens to be small.
+
+**Why dispersion and not the obvious alternative.** Scaling by *baseline* was
+tried first on paper and is arithmetically impossible on the measured data:
+
+```
+to suppress gateway's +234ms noise against its baseline   k must be > ~0.52
+to keep payment's  +109ms detection against 289.1ms       k must be < 0.377
+```
+
+There is no such k, at any assumed gateway baseline between 350 and 550 ms.
+Magnitude does not separate signal from noise here; **variability does**.
+`gateway-svc->order-svc` swings ±200 ms at rest while `order-svc->payment-svc`
+stayed under the 50 ms bar through both null cases, and that gap is what the fix
+uses.
+
+**Why 4x MAD, and why that number is not tuning.** Mean absolute deviation
+rather than a standard deviation: one accumulator, one multiply, no history, and
+markedly less sensitive to the single wild p99 a low-traffic bucket produces.
+For a normal distribution σ ≈ 1.253 × MAD, so 4 × MAD ≈ 3.2 σ — roughly a 0.1%
+chance per observation of a spurious breach, with the 3-of-5 sustained window on
+top of that. **The number came from the distribution, not from the golden set.**
+Picking it by running the set until it went green is precisely what M8 forbids,
+and the difference matters more than the number does.
+
+**M6 applies one derivative up.** Dispersion is learned only on windows that are
+unambiguously clean, exactly as the level is. Folding |delta| in on every
+observation would let a noisy fault raise its own bar until it stopped being
+detectable — the boiling frog applied to variance, and *harder* to spot than the
+original, because nothing about the baseline would look wrong.
+`test_dispersion_does_not_learn_from_a_breaching_window` exists to make that
+edit fail loudly.
+
+Warmup establishes the noise floor alongside the level. Without that, the first
+armed cycle judges every edge at the bare 50 ms floor — the pre-F43 behaviour,
+arriving at the exact moment the detector is first allowed to alert.
+
+**The bar rides on the alert.** Once the threshold is per-edge, "+234 ms above
+baseline" is no longer a judgement: on a noisy edge it is nothing, on a quiet one
+it is enormous. Slack copy and the SSE payload now carry `thresholdMs` and
+`madMs`, so a responder can see why *this* edge needed more evidence than another
+one.
+
+**Verified against the flat threshold before being committed.**
+`test_the_measured_ci_failure_is_separable` drives both real numbers through one
+detector — +234 ms on the noisy parent, +109 ms on the quiet child — and asserts
+opposite outcomes. It goes red on the pre-F43 line and green on the fix.
+
+**What this may cost, stated before the run rather than after.** Two cases,
+`user_cpu_saturation` and `payment_db_down`, currently score `wrong_edge`
+*because* `gateway-svc->order-svc` alerts. Suppressing that alert converts them
+to `false_negative` unless the child edge starts alerting on its own — trading
+precision for recall at roughly constant F1. That is a real possibility, it is
+not the intent, and the run is what decides it. Recording the prediction first is
+the only way the result means anything.
 
 ---
 

@@ -78,6 +78,11 @@ def config_from_env() -> DetectorConfig:
         # must say which value produced it.
         min_requests=int(os.environ.get("DETECTOR_MIN_REQUESTS", "100")),
         min_blame_share=float(os.environ.get("DETECTOR_MIN_BLAME_SHARE", "0.05")),
+        # F43. threshold_ms above is now a FLOOR; this scales the bar by each
+        # edge's own observed jitter so the noisiest edge stops being the
+        # twitchiest. 4x MAD is ~3.2 sigma -- chosen from the distribution, not
+        # tuned to the golden set, which would be M8.
+        mad_multiplier=float(os.environ.get("DETECTOR_MAD_MULTIPLIER", "4.0")),
         sustained_cycles=int(os.environ.get("DETECTOR_SUSTAINED_CYCLES", "3")),
         # The error path's only knob. Fixed rather than learned, because zero
         # is the target for errors in a way it never is for latency.
@@ -210,9 +215,10 @@ async def main() -> None:
     # The model artifact, in the log. `eval_runs.detector_cfg` records it per
     # run; this is so the config is legible from a container's first ten lines
     # rather than only from a database.
-    log.info("detector armed: alpha=%.2f threshold=%.0fms min_requests=%d "
-             "sustained=%d/%d error_rate>%.1f%% blame_share>=%.0f%%",
-             cfg.alpha, cfg.threshold_ms, cfg.min_requests,
+    log.info("detector armed: alpha=%.2f threshold>=%.0fms (floor; per-edge bar "
+             "is max(floor, %.1fxMAD)) min_requests=%d sustained=%d/%d "
+             "error_rate>%.1f%% blame_share>=%.0f%%",
+             cfg.alpha, cfg.threshold_ms, cfg.mad_multiplier, cfg.min_requests,
              cfg.sustained_cycles, cfg.sustained_window,
              cfg.error_rate_threshold * 100, cfg.min_blame_share * 100)
 

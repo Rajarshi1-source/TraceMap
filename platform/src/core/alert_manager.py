@@ -54,9 +54,16 @@ def build_blocks(a: Anomaly, deploy: DeployCorrelation,
     else:
         headline = f"Latency regression: {a.source} -> {a.target}"
         # Critical path FIRST. This ordering is the whole point.
+        # F43: the bar is per-edge now, so "+234ms" alone is not a judgement --
+        # on a noisy edge that is nothing, on a quiet one it is enormous. Naming
+        # the bar is what lets a responder tell those apart, and it is also the
+        # fastest way to see the detector was not merely being twitchy.
+        bar = (f", bar {a.threshold_ms:.0f}ms for this edge"
+               if a.threshold_ms > 0 else "")
         primary = {"type": "mrkdwn",
                    "text": f"*Critical-path p99*\n{a.observed_ms:.0f}ms "
-                           f"(baseline {a.baseline_ms:.0f}ms, +{a.delta_ms:.0f}ms)"}
+                           f"(baseline {a.baseline_ms:.0f}ms, "
+                           f"+{a.delta_ms:.0f}ms{bar})"}
         secondary = {"type": "mrkdwn",
                      "text": f"*Wall-clock p99*\n{a.wall_p99_ms:.0f}ms"}
 
@@ -127,6 +134,10 @@ class AlertManager:
                     "baselineMs": a.baseline_ms,
                     "observedMs": a.observed_ms,
                     "deltaMs": a.delta_ms,
+                    # The bar this edge had to clear, and the noise floor it was
+                    # derived from (F43).
+                    "thresholdMs": a.threshold_ms,
+                    "madMs": a.mad_ms,
                     "wallP99Ms": a.wall_p99_ms,
                     "requestCount": a.request_count,
                     "deploy": deploy.summary(),

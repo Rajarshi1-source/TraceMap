@@ -44,8 +44,46 @@ class DetectorConfig:
     #
     # So: converge fast while warming, then settle. Same estimator, two regimes.
     warmup_alpha: float = 0.5
-    threshold_ms: float = 50.0    # the brief's ">50ms" requirement
+    threshold_ms: float = 50.0    # the brief's ">50ms" requirement -- now a FLOOR
     min_requests: int = 100       # statistical floor per evaluation window
+
+    # F43. `threshold_ms` alone is an ABSOLUTE bar applied to every edge, and
+    # that makes the noisiest edge the twitchiest.
+    #
+    # `gateway-svc->order-svc` absorbs order-svc's entire subtree by design, so
+    # it carries the largest baseline AND the largest absolute jitter in the
+    # graph. Measured on a contended CI runner, with nothing injected at all:
+    #
+    #   null_baseline        alert gateway-svc->order-svc  +178ms
+    #   null_traffic_ramp    alert gateway-svc->order-svc  +234ms
+    #
+    # Both are false positives on cases that inject nothing. Meanwhile the
+    # edge the same run was supposed to catch alerted at +109ms
+    # (payment_latency_60ms). So a single global number cannot separate them:
+    # raise it above 234 and the real detection at 109 is lost.
+    #
+    # A threshold PROPORTIONAL TO BASELINE does not work either, and that is
+    # arithmetic rather than opinion. To suppress gateway's +234ms noise
+    # against its baseline, k must exceed ~0.52; to keep payment's +109ms
+    # detection against a measured 289.1ms baseline, k must stay below 0.377.
+    # There is no such k.
+    #
+    # What DOES separate them is dispersion. gateway->order swings +/-200ms at
+    # rest; payment->order stayed under the 50ms bar through both null cases.
+    # So the bar is scaled by each edge's own observed variability, and an edge
+    # is judged against its own noise rather than against a constant.
+    #
+    # mad_multiplier is not tuned to the golden set -- tuning a threshold to
+    # clear the gate is exactly M8. 4x mean-absolute-deviation is ~3.2 sigma
+    # for a normal distribution, so roughly a 0.1% chance per observation of a
+    # spurious breach, and the 3-of-5 sustained window sits on top of that.
+    # The number came from the distribution, and the eval set is what says
+    # whether it was right.
+    mad_multiplier: float = 4.0
+    # Dispersion is only ever allowed to RAISE the bar, never lower it. A very
+    # stable edge keeps the brief's 50ms and does not become hypersensitive
+    # just because its noise floor is small.
+    mad_alpha: float = 0.2
     # Breaches required, and the window they must land in.
     #
     # "3 CONSECUTIVE" is fragile at a realistic signal-to-noise ratio. Measured
@@ -123,6 +161,12 @@ class Anomaly:
     request_count: int
     wall_p99_ms: float = 0.0
     sustained: int = 0
+    # F43: the bar this breach actually had to clear. Carried on the anomaly
+    # because "+58ms over baseline" is not interpretable without it once the
+    # bar is per-edge -- a responder has to be able to see why THIS edge needed
+    # more evidence than another.
+    threshold_ms: float = 0.0
+    mad_ms: float = 0.0
     sample_trace_ids: list[str] = field(default_factory=list)
 
     @property
@@ -143,6 +187,8 @@ class AnomalyDetector:
     # requirement rather than by habit is the point.
     def _k_base(self, s: str, t: str) -> str:  return f"baseline:edge:{s}:{t}:cp99"
     def _k_warm(self, s: str, t: str) -> str:  return f"baseline:warmup:{s}:{t}"
+    # F43: the edge's own noise floor, learned the same way its level is.
+    def _k_mad(self, s: str, t: str) -> str:   return f"baseline:edge:{s}:{t}:mad"
     def _k_hist(self, s: str, t: str) -> str:  return f"anomaly:hist:{s}:{t}"
     def _k_dedup(self, s: str, t: str) -> str: return f"anomaly:dedup:{s}:{t}"
 
@@ -185,6 +231,13 @@ class AnomalyDetector:
         if warm < cfg.warmup_cycles:
             await self.redis.incr(self._k_warm(s, t))
             await self._update_ewma(obs, baseline, alpha=cfg.warmup_alpha)
+            # Warmup has to establish the noise floor as well as the level, or
+            # the first armed cycle judges every edge at the bare 50ms floor --
+            # which is the pre-F43 behaviour, arriving exactly when the
+            # detector starts being allowed to alert.
+            warm_mad = float(await self.redis.get(self._k_mad(s, t)) or 0.0)
+            await self._update_mad(obs, warm_mad, abs(delta),
+                                   alpha=cfg.warmup_alpha)
             return None
 
         # --- Gate 4: breach? ------------------------------------------------
@@ -204,7 +257,14 @@ class AnomalyDetector:
         # stopped detecting. `test_baseline_does_not_learn_from_anomalies`
         # exists to make this edit fail loudly.
         # ===================================================================
-        breached = delta > cfg.threshold_ms
+        # F43: the bar is per-edge. `threshold_ms` is the floor; an edge whose
+        # own observed dispersion is larger has to clear that instead, so a
+        # noisy edge needs proportionally more evidence and a quiet one is
+        # exactly as sensitive as it was before.
+        mad = float(await self.redis.get(self._k_mad(s, t)) or 0.0)
+        effective = max(cfg.threshold_ms, cfg.mad_multiplier * mad)
+
+        breached = delta > effective
         history = await self._push_history(s, t, breached, cfg.sustained_window)
         recent = history.count("1")
 
@@ -223,6 +283,12 @@ class AnomalyDetector:
             # ===============================================================
             if recent == 0:
                 await self._update_ewma(obs, baseline)
+                # M6 applies to dispersion exactly as it applies to the level.
+                # Learning |delta| from a breaching window would let a noisy
+                # fault raise its own bar until it stopped being detectable --
+                # the boiling frog, one derivative up, and harder to see
+                # because nothing about the baseline would look wrong.
+                await self._update_mad(obs, mad, abs(delta))
             return None
 
         # --- Gate 5: sustained confirmation ---------------------------------
@@ -268,6 +334,8 @@ class AnomalyDetector:
             request_count=obs.request_count,
             wall_p99_ms=round(obs.wall_p99_ms, 2),
             sustained=n,
+            threshold_ms=round(effective, 2),
+            mad_ms=round(mad, 2),
         )
 
     async def evaluate_error_rate(self, obs: EdgeObservation) -> Anomaly | None:
@@ -344,6 +412,23 @@ class AnomalyDetector:
         a = self.cfg.alpha if alpha is None else alpha
         new = a * obs.critical_p99_ms + (1 - a) * baseline
         await self._store_baseline(obs, new)
+
+    async def _update_mad(self, obs: EdgeObservation, mad: float,
+                          deviation: float, alpha: float | None = None) -> None:
+        """EWMA of |observed - baseline|: the edge's own noise floor.
+
+        Mean absolute deviation rather than a standard deviation, for the same
+        reason the level is an EWMA and not a windowed mean: one accumulator,
+        one multiply, no history to store, and it is markedly less sensitive to
+        the single wild p99 that a low-traffic bucket produces.
+
+        For a normal distribution sigma is about 1.253x MAD, so the 4x
+        multiplier is roughly 3.2 sigma.
+        """
+        a = self.cfg.mad_alpha if alpha is None else alpha
+        new = a * deviation + (1 - a) * mad
+        await self.redis.set(self._k_mad(obs.source, obs.target), new,
+                             ex=self.cfg.baseline_ttl_s)
 
     async def _store_baseline(self, obs: EdgeObservation, value: float) -> None:
         await self.redis.set(self._k_base(obs.source, obs.target), value,
