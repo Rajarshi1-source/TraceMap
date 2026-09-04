@@ -24,6 +24,21 @@ p99 rather than wall clock, the SLOs denominate error budgets in critical-path
 milliseconds, and the eval set contains a case that a wall-clock detector fails
 by design.
 
+> **Status — Phase 8 of 8.** Everything above works and is verified against a
+> running stack: five traced services → OpenTelemetry collector → Jaeger v2.20
+> and ClickHouse 26.3 → critical-path assembler → dependency map, anomaly
+> detector, deploy attribution, a twelve-case eval harness, per-edge SLOs and a
+> cost meter.
+>
+> Three things are honestly open, and each links to where it is written up:
+> the **eval gate is currently red** (precision 0.583 against a 0.870 floor —
+> [`docs/EVAL.md §9`](docs/EVAL.md) has the run, the diagnosis and why the fix
+> is not to move the floor); the **live URL is not deployed**; and the **demo
+> video is not recorded** ([`docs/DEMO.md`](docs/DEMO.md) is the script it
+> follows). Forty-one defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), three of them found in
+> Phase 8 by running the system rather than reading it.
+
 ---
 
 ## Quick start
