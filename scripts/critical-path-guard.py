@@ -162,6 +162,42 @@ def main() -> int:
           "; ".join(f"{r['src']}->{r['dst']} {r['bad']}/{r['n']} rows, "
                     f"worst +{r['worst_ms']}ms" for r in viol) or "")
 
+    # F41, second consequence. The invariant above catches per-row inflation;
+    # this catches the roll-up. `crit_ms_sum` must equal the sum of the per-call
+    # rows it aggregates, because the map's blame percentages are computed from
+    # it. When each call carried the service-pair total, the roll-up
+    # over-attributed by roughly the call count -- and unlike the row invariant,
+    # this one produces no impossible value anywhere. It is simply too big, and
+    # nothing about the number looks wrong.
+    #
+    # An INNER join per edge over the same window, not two grand totals: summing
+    # each side independently compares periods where only one has rows.
+    drift = q(f"""
+        SELECT r.src AS src, r.dst AS dst,
+               round(r.rollup, 1) AS rollup,
+               round(t.raw, 1)    AS raw,
+               abs(r.rollup - t.raw) / nullIf(t.raw, 0) AS frac
+        FROM (
+            SELECT source_service AS src, target_service AS dst,
+                   sum(crit_ms_sum) AS rollup
+            FROM tracemap.service_edges_1m
+            WHERE time_bucket >= now() - INTERVAL {args.window}
+            GROUP BY src, dst
+        ) r
+        INNER JOIN (
+            SELECT source_service AS src, target_service AS dst,
+                   sum(critical_ms) AS raw
+            FROM tracemap.trace_edges
+            WHERE time_bucket >= now() - INTERVAL {args.window}
+            GROUP BY src, dst
+        ) t ON r.src = t.src AND r.dst = t.dst
+        WHERE frac > 0.001
+    """)
+    check("F41 - roll-up crit_ms_sum equals the sum of its per-call rows",
+          not drift,
+          "; ".join(f"{d['src']}->{d['dst']} rollup={d['rollup']} raw={d['raw']}"
+                    for d in drift) or "")
+
     # Compare per (time_bucket, edge), not as two grand totals. The two sides
     # cover different spans of history - the reconciler works from tracemap.spans
     # on a rolling 5-minute lookback, the assembler from a watermark it advances
