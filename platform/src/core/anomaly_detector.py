@@ -284,31 +284,34 @@ class AnomalyDetector:
             if recent == 0:
                 await self._update_ewma(obs, baseline)
 
-            # Dispersion learns on ANY non-breaching observation, not only on an
-            # all-clean window, and the difference is deliberate.
-            #
-            # The level uses `recent == 0` because a sustained fault produces
-            # occasional sub-threshold cycles and letting each teach the
-            # baseline walks it onto the fault. Dispersion has the opposite
-            # exposure: the noisiest edges are precisely the ones whose windows
-            # are rarely all-clean, so gating MAD on `recent == 0` biases it
-            # DOWNWARD exactly where it is needed and can deadlock outright --
-            # an edge too jittery to get a clean window never learns that it is
-            # jittery, so its bar stays at the floor and F43 is not fixed for
-            # the only edges it was written for.
-            #
-            # Found by reading live Redis after the first fix: `product-svc` and
-            # `user-svc` had learned a noise floor and `gateway-svc->order-svc`
-            # and `order-svc->payment-svc` -- the two edges this is about -- had
-            # no MAD key at all.
-            #
-            # M6 still holds, because the sample is bounded: this branch only
-            # runs when `delta <= effective`, so a breaching value can never
-            # enter the estimate. That also makes it self-limiting rather than
-            # runaway -- MAD converges to the mean |delta| of samples below a
-            # bar that is itself 4x MAD, which has a fixed point at the edge's
-            # true jitter and no way to climb past it.
-            await self._update_mad(obs, mad, abs(delta))
+                # F43b. Dispersion is gated on the SAME all-clean window as the
+                # level, and getting here took being wrong in production.
+                #
+                # An earlier pass learned MAD on any non-breaching observation,
+                # reasoning that the sample is bounded by the bar so it could
+                # not run away. That reasoning is wrong, and the eval set
+                # produced the counter-example: under a SUSTAINED fault the
+                # sub-threshold cycles are not noise, they are the fault's own
+                # lower excursions. Learning them raises MAD, which raises the
+                # bar, which makes more cycles sub-threshold. The bar walks up
+                # and chases the fault.
+                #
+                # Measured, run 33887207039: recall fell from 1.000 to 0.500,
+                # and the detector logged
+                #
+                #   edge gateway-svc->order-svc breach 1/3 in last 5 (+1788.3ms)
+                #
+                # A delta of 1788ms reaching only one breach in five is not a
+                # threshold being too high; it is a threshold moving.
+                #
+                # This is exactly the boiling frog M6 exists to prevent, one
+                # derivative up, and it is harder to see because nothing about
+                # the LEVEL looks wrong. The test that was supposed to prevent
+                # it fed only pure-breaching observations, so the guard held and
+                # the realistic oscillating case was never exercised --
+                # `test_an_oscillating_fault_cannot_walk_the_bar_up_after_itself`
+                # now does.
+                await self._update_mad(obs, mad, abs(delta))
             return None
 
         # --- Gate 5: sustained confirmation ---------------------------------

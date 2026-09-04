@@ -239,52 +239,52 @@ async def test_a_cold_edge_still_never_alerts_on_first_sight():
 
 
 @pytest.mark.asyncio
-async def test_a_noisy_edge_can_learn_its_noise_floor_without_a_clean_window():
-    """The bootstrapping deadlock, found in live Redis rather than in a test.
+async def test_an_oscillating_fault_cannot_walk_the_bar_up_after_itself():
+    """F43b -- the counter-example the eval set produced, as a unit test.
 
-    Gating dispersion on `recent == 0` -- an all-clean window, which is what
-    the LEVEL correctly requires -- biases it downward exactly where it matters
-    and can deadlock: an edge too jittery to ever get a clean window never
-    learns that it is jittery, so its bar stays at the floor and F43 is not
-    fixed for the only edges it was written for.
+    An earlier pass learned MAD on any non-breaching observation, reasoning
+    that the sample is bounded by the bar so it could not run away. That
+    reasoning is wrong. Under a SUSTAINED fault the sub-threshold cycles are
+    not noise -- they are the fault's own lower excursions. Learning them
+    raises MAD, which raises the bar, which makes more cycles sub-threshold,
+    and the bar climbs after the fault until nothing is detectable.
 
-    Observed after the first version of the fix: product-svc and user-svc had
-    learned a noise floor; gateway-svc->order-svc and order-svc->payment-svc,
-    the two edges this is about, had no MAD key at all.
+    Run 33887207039 measured the consequence: recall 1.000 -> 0.500, with
 
-    Here the edge alternates a breaching spike with sub-threshold jitter, so no
-    five-cycle window is ever clean.
+        edge gateway-svc->order-svc breach 1/3 in last 5 (+1788.3ms)
+
+    in the logs. A delta of 1788ms reaching one breach in five is not a
+    threshold that is too high; it is a threshold that is moving.
+
+    The numbers below are chosen so the lower excursion sits UNDER the starting
+    bar and the upper one above it -- which is the whole mechanism. An earlier
+    version of this test oscillated between two values that both breached, so
+    dispersion never learned anything and it passed against the bug it was
+    written to catch.
     """
     d, r = detector()
-    await arm(d, r, baseline=100.0, mad=0.0)
+    await arm(d, r, baseline=100.0, mad=40.0)          # bar starts at 160ms
 
-    for i in range(30):
-        # A spike every third cycle keeps `recent` above zero throughout.
-        await d.evaluate(obs(100.0 + (400.0 if i % 3 == 0 else 35.0)))
+    for i in range(40):
+        # +150 is under the starting bar and teaches; +600 is over it.
+        await d.evaluate(obs(100.0 + (600.0 if i % 2 else 150.0)))
 
-    assert float(r.store.get(d._k_mad("a", "b"), 0)) > 10.0, (
-        "the edge never learned its noise floor; the bar stays at the 50ms "
-        "floor and F43 is unfixed for exactly the edges it targets"
+    bar = d.cfg.mad_multiplier * float(r.store[d._k_mad("a", "b")])
+    assert bar < 300.0, (
+        f"the bar climbed to {bar:.0f}ms while chasing a fault that never "
+        "exceeded 600ms; dispersion is learning from the fault's own "
+        "excursions and will eventually suppress it entirely"
     )
 
 
 @pytest.mark.asyncio
-async def test_dispersion_cannot_run_away():
-    """The bar is self-limiting, which is why learning outside a clean window
-    is safe.
+async def test_a_large_fault_is_never_suppressed_however_noisy_the_edge_looks():
+    """The floor under the whole mechanism.
 
-    MAD only ever samples deltas BELOW the current bar, and the bar is 4x MAD,
-    so the estimate converges on the edge's true jitter instead of ratcheting
-    upward until the edge is undetectable.
+    Whatever dispersion has learned, a fault an order of magnitude past the
+    baseline has to surface. If this fails the detector has stopped being a
+    detector, and no precision figure redeems that.
     """
     d, r = detector()
-    await arm(d, r, baseline=100.0, mad=0.0)
-
-    for i in range(200):
-        await d.evaluate(obs(100.0 + (30.0 if i % 2 else -30.0)))
-
-    mad = float(r.store[d._k_mad("a", "b")])
-    # True mean |deviation| is ~30ms; the estimate must settle near it rather
-    # than climb. A generous ceiling: anything approaching 4x would mean the
-    # bar had started feeding itself.
-    assert 15.0 < mad < 60.0, f"MAD settled at {mad}, outside its fixed point"
+    await arm(d, r, baseline=100.0, mad=40.0)          # bar = 160ms
+    assert await sustained(d, obs(100.0 + 1788.0)) is not None

@@ -259,153 +259,128 @@ dedicated CI hardware and not locally.
 
 ---
 
-## 9. Three full-set runs, all red — and what they actually measured
+## 9. Four full-set runs, all red — and what each one bought
 
 Recorded here rather than quietly re-run until they passed, because a harness
-whose failures are not published is a harness nobody should believe.
+whose failures are not published is a harness nobody should believe. Two of these
+runs measured the harness rather than the detector, and one measured a defect the
+fix itself introduced. That sequence is the useful part.
 
-| | Run 1 | Run 2 | Run 3 | gate |
-|---|---|---|---|---|
-| run | [33848444520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [33860377967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [33870357809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | |
-| commit | `8308c692` | `26a3cb629` | `0fe7226e9` | |
-| **traps valid?** | unknown | **no** (F42) | **yes** | |
-| precision | 0.583 | 0.500 | **0.500** | ≥ 0.870 ✗ |
-| recall | 1.000 | 1.000 | **1.000** | — |
-| f1 | 0.737 | 0.667 | **0.667** | ≥ 0.820 ✗ |
-| mttd p50 | 122 s | 183 s | 179 s | — |
-| mttd p95 | 213 s | 214 s | 282 s | ≤ 432 s ✓ |
-| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | **FAIL** |
+| | Run 1 | Run 2 | Run 3 | Run 4 | gate |
+|---|---|---|---|---|---|
+| run | [3384…4520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [3386…7967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [3387…7809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | [3388…7039](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33887207039) | |
+| detector | flat 50 ms | flat 50 ms | flat 50 ms | 4× MAD | |
+| **traps valid?** | unknown | **no** (F42) | yes | yes | |
+| precision | 0.583 | 0.500 | 0.500 | **0.714** | ≥ 0.870 ✗ |
+| recall | 1.000 | 1.000 | 1.000 | **0.500** | — |
+| f1 | 0.737 | 0.667 | 0.667 | **0.588** | ≥ 0.820 ✗ |
+| mttd p95 | 213 s | 214 s | 282 s | 214 s | ≤ 432 s ✓ |
+| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | 5 tp / 2 fp / **5 fn** | **FAIL** |
 
-**Recall is 1.000 in all three runs. Zero false negatives across thirty-six case
-executions.** The detector misses nothing. It over-alerts.
-
-**MTTD p95 clears its ceiling in all three.** This is the number a developer
+**MTTD p95 clears its ceiling in every run.** This is the number a developer
 machine cannot produce: detection latency is measured against `time.monotonic()`,
 which keeps advancing while a process is descheduled, so a host that stalls a
 worker (F36: 471 s, measured) inflates every latency in the set.
 
-### Run 3 is the one that counts
+### Runs 1–3: the harness, then the detector
 
 Runs 1 and 2 were scored against a decoy leg that was measurably carrying blame
 — **F42**, a guard whose only hard assertion read a hardcoded dict and therefore
-could not fail. Run 2's topology snapshot, taken on quiet traffic before any
-fault:
+could not fail. Run 2's pre-fault snapshot:
 
 ```
 crit p99 order-svc->user-svc  56.6 (recorded 0.0)  DRIFT     <- the decoy
 ```
 
-Run 3 ran with the fixed guard, and it passed on measurement rather than on a
-constant:
+Run 3 ran with the fixed guard, which asserted validity on measurement:
 
 ```
-crit p99 order-svc->payment-svc  289.1 (recorded 157.0)  DRIFT
-crit p99 order-svc->product-svc   48.3 (recorded  49.3)  OK
-crit p99 order-svc->user-svc       0.0 (recorded   0.0)  OK
-every declared decoy leg still carries no blame           OK
+crit p99 order-svc->user-svc   0.0 (recorded 0.0)  OK
+every declared decoy leg still carries no blame     OK
 ```
 
-**The decoy measured exactly 0.0. The traps were provably valid. Precision was
-still 0.500.**
+**The traps were provably valid and precision was still 0.500.** That settled it:
+the score was a fact about the detector, and fixing the harness is what made the
+detector defect legible. `gateway-svc→order-svc` was the blamed edge in four of
+six failures, *including both null cases* — and `null_baseline` injects nothing
+and holds steady load.
 
-That settles the question F42 raised: the score is *not* an artefact of the
-harness. The detector genuinely over-alerts on this hardware.
+### Run 4: the fix worked, and then a second defect ate the gain
 
-### The failure is one edge, and it is stable
+**F43.** The breach test was a flat 50 ms for every edge, which makes the
+*noisiest* edge the twitchiest — precisely backwards. `gateway-svc→order-svc`
+absorbs order-svc's whole subtree, so it carries the largest baseline and the
+largest jitter in the graph. Scaling by *baseline* is arithmetically impossible
+here: suppressing gateway's measured +234 ms of noise needs k > ~0.52, while
+keeping payment's +109 ms detection needs k < 0.377. Magnitude does not separate
+signal from noise. **Variability does**, so the bar became
+`max(50 ms, 4 × MAD)` per edge.
 
-| Case | Run 1 | Run 2 | Run 3 |
-|---|---|---|---|
-| `null_baseline` | tp | tp | **fp** → `gateway-svc→order-svc` |
-| `null_traffic_ramp` | fp | fp | **fp** → `gateway-svc→order-svc` |
-| `user_cpu_saturation` | wrong | wrong | **wrong** → `gateway-svc→order-svc` |
-| `payment_db_down` | wrong | wrong | **wrong** → `gateway-svc→order-svc` |
-| `gateway_latency_cascade` | fp | fp | **fp** → co-alert |
-| `parallel_decoy` | fp | fp | **fp** → co-alert |
-| the other six | tp | tp | tp |
+**It did what it was built to do.** Both null cases passed for the first time in
+the project's history — including `null_traffic_ramp`, which is **F38**, logged
+open as needing its own throughput signal.
 
-**`gateway-svc→order-svc` is the blamed edge in four of run 3's six failures,
-including *both* null cases** — and `null_baseline` holds steady load with
-nothing injected at all. That is not F38 (a traffic *ramp*); it fires at rest.
+**And recall halved.** Five false negatives, three of them cases that had
+detected cleanly in every previous run. The detector's own log says why:
 
-### Why — and the fix is not a bigger number
-
-Compare the same edges, same code, two hosts:
-
-| edge | this laptop | CI runner (run 3) |
-|---|---|---|
-| `order-svc→payment-svc` | ~148 ms | **289.1 ms** |
-| `order-svc→product-svc` | ~48 ms | 48.3 ms |
-| `order-svc→user-svc` | 0.0 ms | 0.0 ms |
-
-The runner is roughly twice as slow on the critical path and much noisier.
-`gateway-svc→order-svc` absorbs `order-svc`'s entire subtree by design — 735.0
-in the specification test, because the gateway really did wait 735 ms on order —
-so it carries both **the largest baseline and the largest absolute jitter** of
-any edge in the graph.
-
-The detector's breach test is a **fixed absolute threshold**:
-
-```python
-threshold_ms: float = 50.0    # the brief's ">50ms" requirement
-breached = delta > cfg.threshold_ms
+```
+edge gateway-svc->order-svc breach 1/3 in last 5 (+1788.3ms)
 ```
 
-Fifty milliseconds is a large signal on an edge whose baseline is 30 ms. On an
-edge whose baseline is ~290 ms and swinging with runner contention, it sits
-**inside the noise**. The edge with the biggest numbers breaches most easily,
-which is the opposite of what anyone wants.
+A delta of 1788 ms reaching one breach in five is not a threshold that is too
+high. **It is a threshold that is moving.**
 
-This is **F43**, and the fix is not to raise 50 to 80. That would clear these
-cases by making the detector deafer everywhere, and picking the number without a
-run to justify it is exactly M8. The fix is for the breach test to scale with
-the edge's own baseline or its observed variability, so an edge is judged
-against itself rather than against a constant borrowed from the brief.
+This is **F43b**, and it was introduced by the fix's own second pass. Dispersion
+had been gated on the all-clean window — the same guard the level uses — and that
+gate was removed on the reasoning that the sample is always below the bar, so the
+estimate could not run away. Under a *sustained fault* that reasoning fails: the
+sub-threshold cycles are not noise, they are the fault's own lower excursions.
+Learning them raises MAD, which raises the bar, which makes more cycles
+sub-threshold. The bar climbs after the fault.
 
-### The three remaining failures, briefly
+That is exactly the failure M6 exists to prevent, one derivative up, and harder
+to see because nothing about the *level* looks wrong.
 
-- **`null_traffic_ramp`** is **F38**, logged open before any of these runs: the
-  detector cannot tell a latency rise caused by load from one caused by a
-  regression. Every existing gate correctly declines to fire.
-- **`user_cpu_saturation` / `payment_db_down`** are `docs/LIMITATIONS.md`
-  caveat 7 — nothing suppresses a parent whose rise is fully explained by a
-  child's. Suppressing parents unconditionally would be wrong:
-  `gateway_latency_cascade` is a case where the parent genuinely *is* the
-  finding.
-- **`parallel_decoy` / `gateway_latency_cascade`** found the right edge and lost
-  the case to a second alert on a trap. The scoring is correct to charge for
-  that: an extra alert on an innocent edge costs the same on-call hour whether
-  or not a correct one accompanied it.
+Reverted. And the test that should have caught it —
+`test_dispersion_does_not_learn_from_a_breaching_window` — fed only
+pure-breaching observations, so its guard held trivially and the realistic
+oscillating case was never exercised. Its replacement drives the real mechanism
+and was checked red first, at which point the bar climbs to 477 ms while chasing
+a 600 ms fault.
 
-All three are the same shape as F43 — an edge alerting when it should not — and
-it is plausible that a baseline-relative threshold moves several of them at
-once. Plausible is not measured, which is the whole point of this document.
+### What each run actually bought
+
+1. **Run 1** — the first complete twelve-case execution, and the first MTTD p95
+   the project could quote.
+2. **Run 2** — F42. The scoreboard was measuring the harness, and nothing in the
+   artifact said so. Every `eval-run.json` now records `topology_at_start`,
+   `traps_valid` and `invalid_traps`, so a number and the reason it cannot be
+   trusted travel together.
+3. **Run 3** — a trustworthy measurement, and with the harness explanation
+   removed, F43 became legible.
+4. **Run 4** — proof that the F43 mechanism works on its target (both null cases
+   passed) and proof that its second pass was wrong (recall halved). Neither
+   fact was available from reading the code; the second was invisible to the
+   unit test written specifically to prevent it.
+
+### The open question, stated rather than assumed
+
+With correct gating, does the null-case gain survive — or did it come *from* the
+runaway? The bar that suppressed `gateway-svc→order-svc` may have been a bar that
+had already walked upward. **Only a run answers that**, and guessing would be
+exactly the failure mode this whole document exists to prevent.
 
 ### What is not being done about it
 
-**No threshold has been moved.** Tuning to clear a gate is what M8 forbids, and
-"precision was low, so we raised the threshold" is indistinguishable from having
-no gate. `eval/baselines/main-full.json` remains **absent** and
-`check_regression.py` continues to exit 2 — the designed behaviour for "not yet
-measured". A baseline will be committed from a green run and from nothing else.
+**No threshold has been moved to clear the gate.** `4 × MAD` came from the
+distribution — σ ≈ 1.253 × MAD, so 4× is ≈ 3.2σ, roughly 0.1 % per observation
+with the 3-of-5 window on top — and not from running the set until it went green.
+That distinction matters more than the number.
 
-**The score is not adjusted for F42 either.** Runs 1 and 2 stand as recorded,
-labelled with the reason they cannot be trusted. Adjusting a score for a fault
-found in your own measurement apparatus is how a scoreboard stops meaning
-anything.
+`eval/baselines/main-full.json` remains **absent** and `check_regression.py`
+continues to exit 2, which is the designed behaviour for "not yet measured". A
+baseline will be committed from a green run and from nothing else.
 
-### What this run bought
-
-Three things that did not exist before it:
-
-1. **A trustworthy measurement.** Run 3 is the first scoreboard whose traps were
-   verified valid *before* the cases ran. Precision 0.500 is now a fact about
-   the detector rather than a fact about the harness.
-2. **A specific, testable hypothesis** — F43, with a mechanism and a measurement
-   behind it, rather than "precision is low".
-3. **A harness that can no longer hide this.** The guard fails on an invalid
-   decoy, and every future `eval-run.json` records `topology_at_start`,
-   `traps_valid` and `invalid_traps` alongside its scores, so a number and the
-   reason it cannot be trusted travel together.
-
-The next run is worth doing only after F43 is addressed. Running the set again
-unchanged would produce 0.500 a third time and teach nothing.
+**No score has been adjusted.** Runs 1 and 2 stand as recorded, labelled with the
+reason they cannot be trusted. Adjusting a score for a fault found in your own
+measurement apparatus is how a scoreboard stops meaning anything.

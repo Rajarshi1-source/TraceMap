@@ -32,16 +32,15 @@ by design.
 >
 > Three things are honestly open, and each links to where it is written up.
 >
-> The **eval gate is red**: precision 0.500 over three full twelve-case runs on
-> CI, against a 0.870 floor. Recall is 1.000 in every run, with **zero false
-> negatives across thirty-six case executions**, and MTTD p95 clears its ceiling
-> every time. The third run is the one that counts — its traps were *verified
-> valid before the cases ran*, after a harness defect (**F42**) invalidated the
-> first two. The remaining cause is **F43**: a flat 50 ms threshold makes the
-> largest-baseline edge the twitchiest, so the edge that absorbs the whole
-> subtree false-positives on a null case with nothing injected.
-> [`docs/EVAL.md §9`](docs/EVAL.md) has all three runs and why the fix is not to
-> raise the number.
+> The **eval gate is red** after four full twelve-case runs on CI. MTTD p95
+> clears its ceiling every time. Two of the four measured the *harness* rather
+> than the detector (**F42**), which is now impossible to repeat: every run
+> artifact records whether its own traps were valid. The fourth tested a fix for
+> **F43** and produced the most useful failure of the set — both null cases
+> passed for the first time, and recall halved, because the fix's second pass
+> reintroduced M6's boiling frog one derivative up (**F43b**). Reverted, with the
+> test that catches it. [`docs/EVAL.md §9`](docs/EVAL.md) has all four runs and
+> what each one bought.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).

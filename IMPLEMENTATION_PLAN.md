@@ -1608,13 +1608,78 @@ one.
 detector — +234 ms on the noisy parent, +109 ms on the quiet child — and asserts
 opposite outcomes. It goes red on the pre-F43 line and green on the fix.
 
-**What this may cost, stated before the run rather than after.** Two cases,
-`user_cpu_saturation` and `payment_db_down`, currently score `wrong_edge`
-*because* `gateway-svc->order-svc` alerts. Suppressing that alert converts them
-to `false_negative` unless the child edge starts alerting on its own — trading
-precision for recall at roughly constant F1. That is a real possibility, it is
-not the intent, and the run is what decides it. Recording the prediction first is
-the only way the result means anything.
+**The prediction, recorded before the run and only half right.** It said
+`user_cpu_saturation` and `payment_db_down` might convert from `wrong_edge` to
+`false_negative`. `user_cpu_saturation` did. What it did not anticipate was that
+three *detecting* cases would go silent as well, because the mechanism at fault
+was not the height of the bar but its movement — see F43b below.
+
+**F43b — the fix's second pass reintroduced the boiling frog, one derivative up.**
+
+Between dispatching the first fix and it running, live Redis showed no MAD key
+for `gateway-svc->order-svc` or `order-svc->payment-svc` — the two edges the fix
+exists for. The cause looked obvious: MAD was gated on `recent == 0`, the
+all-clean window, and the noisiest edges rarely have one. So the gate was
+removed and MAD learned on any *non-breaching* observation, with what looked
+like a sound bounding argument: the sample is always below the bar, so the
+estimate cannot run away.
+
+**The argument is wrong, and the eval set produced the counter-example.**
+
+Under a sustained fault the sub-threshold cycles are not noise. They are the
+fault's own lower excursions. Learning them raises MAD, which raises the bar,
+which makes more cycles sub-threshold — and the bar climbs after the fault until
+nothing is detectable. Run 33887207039:
+
+| | run 3 (flat 50 ms) | run 4 (4x MAD, ungated) |
+|---|---|---|
+| precision | 0.500 | **0.714** |
+| recall | **1.000** | **0.500** |
+| f1 | 0.667 | **0.588** |
+| | 6 tp / 6 fp / 0 fn | 5 tp / 2 fp / **5 fn** |
+
+and, in the detector's own log:
+
+```
+edge gateway-svc->order-svc breach 1/3 in last 5 (+1788.3ms)
+edge gateway-svc->order-svc breach 1/3 in last 5 (+618.1ms)
+edge order-svc->user-svc     breach 1/3 in last 5 (+363.8ms)
+```
+
+**A delta of 1788 ms reaching one breach in five is not a threshold that is too
+high. It is a threshold that is moving.**
+
+This is precisely the failure M6 exists to prevent, one level up, and it is
+harder to see because nothing about the *level* looks wrong — the baseline is
+correct throughout, and only the bar has drifted.
+
+**Reverted:** dispersion is gated on the same all-clean window as the level.
+
+**The deadlock that motivated the change was an artefact of the observation.**
+Those two edges had no MAD key because the detector container had been rebuilt
+against a *warm* Redis: their baselines and warmup counters survived, so they
+skipped warmup — which is where MAD is seeded — and then never had a clean
+window. On a cold start, which is what CI does and what any real deployment
+does, warmup seeds every edge. Hot-swapping a binary against live state is a
+real upgrade concern, but it is a migration problem, not a reason to weaken M6.
+
+**The test that was supposed to prevent this gave false assurance.**
+`test_dispersion_does_not_learn_from_a_breaching_window` fed only
+pure-breaching observations, so the guard held trivially and the realistic case
+— a fault oscillating either side of the bar — was never exercised. The
+replacement drives the actual mechanism, and the first draft of *it* was wrong
+too: it oscillated between two values that both breached, so nothing was
+learned and it passed against the bug it was written to catch. Checked red
+before being kept, at which point the bar climbs to 477 ms while chasing a
+600 ms fault.
+
+**What run 4 did establish, and it is not nothing.** Both null cases passed for
+the first time in the project's history — including `null_traffic_ramp`, which
+is F38 and was logged open as needing its own throughput signal. Suppressing
+false positives on the noisiest edge is exactly what F43 set out to do, and it
+worked. The open question is whether that gain survives correct gating, or
+whether it came *from* the runaway. Only a run answers that, which is the whole
+point of having one.
 
 ---
 
