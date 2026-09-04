@@ -164,12 +164,25 @@ The metric mode is in the URL on purpose. The point of this dashboard is to hand
 someone the edge they should go fix, and a view you cannot link to is a view you
 have to describe over a call.
 
-<details><summary>The empty state, before any traffic</summary>
+<details><summary>Two states worth showing that are not the happy path</summary>
+
+**Degraded.** ClickHouse stopped, 101 seconds into the outage — past the point
+where this endpoint used to return HTTP 500 (F40). The graph is still there, the
+numbers are still real, and the banner says exactly how old they are:
+
+![degraded, serving last-good](docs/screenshots/03-degraded-last-good.png)
+
+> *Showing last-good data — the graph is 101s old. The analytics tier is
+> degraded; these numbers are real but not current.*
+
+Silently stale numbers are worse than none (M26). Refusing to serve them at all
+is worse still — it takes the last known shape of the system away from an
+operator at the moment they most want it.
+
+**Empty.** Before any traffic. It names the command to run rather than showing a
+blank canvas — the state a first-time reader is most likely to hit.
 
 ![empty state](docs/screenshots/05-empty-state.png)
-
-It names the command to run rather than showing a blank canvas — this is the
-state a first-time reader is most likely to hit.
 
 </details>
 

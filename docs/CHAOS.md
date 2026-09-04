@@ -183,6 +183,13 @@ Every row past +60 s was an HTTP 500 before the fix. The age keeps climbing and
 is reported honestly rather than reset, so a viewer can see exactly how far
 behind the data is.
 
+And the same state as a viewer sees it, 101 seconds into an outage:
+
+![degraded, serving last-good](screenshots/03-degraded-last-good.png)
+
+Five services, five edges, real numbers, and a banner that says how old they
+are. Before F40 this page was rendering an error.
+
 ## 6. Recovery, measured
 
 | | |
