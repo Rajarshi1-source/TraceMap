@@ -37,9 +37,16 @@ logs: ## Tail logs from the core profile
 
 demo: up seed ## Boot core and pre-load traffic - use this before a screen-share
 	@echo ""
-	@echo "  Dashboard  http://localhost:3002"
-	@echo "  Jaeger UI  http://localhost:16686"
-	@echo "  Gateway    http://localhost:3000"
+	@echo "  Dashboard   http://localhost:3002"
+	@echo "  ... critical-path view is linkable:"
+	@echo "              http://localhost:3002/?metric=critical"
+	@echo "  Jaeger UI   http://localhost:16686"
+	@echo "  Gateway     http://localhost:3000"
+	@echo ""
+	@echo "  Edge SLOs   http://localhost:8090/api/slo    (D6 - budgets on critical path)"
+	@echo "  Cost meter  http://localhost:8090/api/cost   (D5 - measured from system.parts)"
+	@echo ""
+	@echo "  Read docs/DEMO.md before showing this to anyone."
 	@echo ""
 
 seed: ## 60s of load so the graph is populated on first look
