@@ -152,6 +152,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # ghcr.io requires a lowercase repository name and this one is
+      # `Rajarshi1-source/TraceMap`. Interpolating github.repository directly
+      # produces an invalid tag and buildx fails before it builds anything.
+      - name: lowercase the image repository
+        id: repo
+        run: echo "slug=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         id: img
         with:
@@ -159,15 +165,15 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           load: ${{ github.event_name != 'push' }}
           tags: |
-            ghcr.io/${{ github.repository }}/${{ matrix.service }}:${{ github.sha }}
-            ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest
+            ghcr.io/${{ steps.repo.outputs.slug }}/${{ matrix.service }}:${{ github.sha }}
+            ghcr.io/${{ steps.repo.outputs.slug }}/${{ matrix.service }}:latest
           build-args: GIT_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: trivy
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}/${{ matrix.service }}:${{ github.sha }}
+          image-ref: ghcr.io/${{ steps.repo.outputs.slug }}/${{ matrix.service }}:${{ github.sha }}
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
@@ -236,16 +242,29 @@ jobs:
         # statement about the sized host (4 vCPU / 8 GB), which is where it
         # should be quoted from.
         run: |
+          # The k6 image runs as uid 12345 while the workspace belongs to the
+          # runner, so k6 could not write the summary into $PWD -- it printed
+          # the text report and silently produced no file, and the enforcement
+          # step below correctly refused to guess. A world-writable directory
+          # sidesteps the uid mismatch without running the container as root.
+          mkdir -p "$PWD/k6out" && chmod 777 "$PWD/k6out"
+          set +e
           docker run --rm --network tracemap_default \
-            -v "$PWD/load-testing:/scripts" -v "$PWD:/out" \
+            -v "$PWD/load-testing:/scripts" -v "$PWD/k6out:/out" \
             -e SHORT=1 -e RPS=10 -e DURATION=120s \
             -e BASE_URL=http://gateway-svc:3000 \
             grafana/k6 run --summary-export=/out/k6-summary.json \
-            /scripts/normal-checkout-flow.js || true
-          # `|| true` on purpose: the k6 script carries its own thresholds and
-          # exits 99 when they trip, which killed this step before the summary
-          # could be read and left the log saying only "thresholds crossed".
-          # One gate, one place, and it prints the numbers.
+            /scripts/normal-checkout-flow.js
+          k6_exit=$?
+          set -e
+          # Reported, not swallowed. The script carries its own thresholds and
+          # exits 99 when they trip, which used to kill this step before the
+          # summary could be read. A blanket `|| true` fixed that and hid
+          # everything else -- k6 failing to start, or rejecting a flag -- which
+          # is exactly how the missing summary went unexplained for a run.
+          # 99 is the gate talking; anything else is k6 itself.
+          echo "k6 exit: ${k6_exit}"
+          cp "$PWD/k6out/k6-summary.json" k6-summary.json 2>/dev/null || true
       - name: enforce the SLO
         run: |
           test -f k6-summary.json || { echo "::error::k6 produced no summary"; exit 1; }

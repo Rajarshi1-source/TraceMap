@@ -39,6 +39,25 @@ REFERENCES: dict[str, str] = {
 }
 
 
+def archive_members(data: bytes) -> dict[str, bytes]:
+    """The {arcname: bytes} an archive carries.
+
+    Staleness is a question about CONTENT, not about compressed bytes. DEFLATE
+    output at a given level is not guaranteed identical across zlib builds, so
+    comparing the raw archive made `--check` a test of the runner's zlib: the
+    same commit with byte-identical inputs reported all eight archives stale in
+    CI and current on the machine that built them.
+
+    Comparing members catches the thing the guard is actually for -- a SKILL.md
+    edited without rebuilding -- and is indifferent to how the bytes were
+    squeezed.
+    """
+    import io
+
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        return {n: z.read(n) for n in sorted(z.namelist())}
+
+
 def _normalised(path: Path) -> bytes:
     """File bytes with line endings normalised to LF.
 
@@ -107,7 +126,16 @@ def main() -> int:
         dest = OUT / f"{name}.skill"
         have = dest.read_bytes() if dest.is_file() else b""
 
-        if have == want:
+        # Compared by CONTENT, not by compressed bytes -- see archive_members().
+        try:
+            current = bool(have) and archive_members(have) == archive_members(want)
+        except zipfile.BadZipFile:
+            current = False
+
+        if current:
+            # Byte-identical is not required, so an archive whose contents
+            # already match is left alone rather than rewritten. Rewriting it
+            # would churn a binary in every diff for no gain.
             status = "unchanged"
         elif args.check:
             status = "STALE"
@@ -116,7 +144,13 @@ def main() -> int:
             dest.write_bytes(want)
             status = "written"
 
-        digest = hashlib.md5(want).hexdigest()[:10]
+        # Digest over the CONTENT, so the same sources print the same digest on
+        # any machine. A digest of the compressed bytes varies with zlib and is
+        # therefore useless for the one thing a digest is for here: telling two
+        # people whether they are looking at the same skill.
+        digest = hashlib.md5(
+            b"".join(k.encode() + v for k, v in sorted(archive_members(want).items()))
+        ).hexdigest()[:10]
         print(f"  {status:<10} {name:<34} {len(want):>6} b  {digest}")
 
     if stale:

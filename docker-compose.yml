@@ -84,11 +84,18 @@ services:
       - "8123:8123"     # HTTP
       - "9000:9000"     # native
     healthcheck:
+      # Probes the NATIVE port (9000), not just HTTP (8123), because 8123
+      # answers /ping before 9000 accepts connections -- and 9000 is the port
+      # the consumers actually use. Jaeger pings ClickHouse once at startup and
+      # exits(1) on refusal, so "healthy" meaning "HTTP is up" let it race the
+      # native listener and die. A readiness check has to mean ready for the
+      # thing that depends on it.
+      #
       # 127.0.0.1, NOT localhost. Inside the container `localhost` resolves to
       # ::1 first, and the image binds ::1 only when IPv6 is available on the
       # network - which it is not here, so the probe gets connection refused
       # while the server is perfectly healthy on IPv4.
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping >/dev/null && clickhouse-client --host 127.0.0.1 --port 9000 --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1' >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -128,6 +135,12 @@ services:
       - jaegerdata:/var/lib/jaeger
     depends_on:
       volume-init: { condition: service_completed_successfully }
+      # Under STORAGE_PROFILE=clickhouse, Jaeger pings ClickHouse once while
+      # starting and exits(1) if it is refused -- there is no retry. Without
+      # this edge it raced the database and died, which is why the badger
+      # profile passed CI and the clickhouse one did not. The dependency is
+      # harmless under badger: ClickHouse is in the core profile either way.
+      clickhouse: { condition: service_healthy }
     ports:
       - "16686:16686"     # UI
     healthcheck:
