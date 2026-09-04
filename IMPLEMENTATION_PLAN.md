@@ -1443,6 +1443,25 @@ The guard already runs in `eval.yml` immediately before the golden set, so this
 now stops a run that would produce a meaningless scoreboard rather than
 annotating it.
 
+**The workflow step's own comment described the correct behaviour the whole
+time:**
+
+```yaml
+# Structural drift invalidates the case files before it invalidates
+# any score. A leg that has started carrying critical-path blame
+# cannot be the decoy at any delay, and case 006 would then fail
+# against a detector doing exactly the right thing.
+run: python scripts/topology-guard.py
+```
+
+That is an exact description of what happened. The step had no
+`continue-on-error`, so it would have failed the job — the guard simply never
+returned non-zero, because the assertion that should have caught it was reading
+a constant. **The intent was documented, wired up correctly, and not
+implemented**, which is a failure mode worth naming on its own: a comment that
+describes the guarantee makes it harder, not easier, to notice the guarantee is
+absent.
+
 **Verified by reproducing the CI condition rather than by reasoning.** +250 ms
 was injected into `user-svc` to make it the slowest sibling, and the guard went
 red with the right message and exit code 1:
