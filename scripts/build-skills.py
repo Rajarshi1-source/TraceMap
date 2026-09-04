@@ -39,6 +39,22 @@ REFERENCES: dict[str, str] = {
 }
 
 
+def _normalised(path: Path) -> bytes:
+    """File bytes with line endings normalised to LF.
+
+    Without this the archive is not reproducible across platforms, and the
+    failure is baffling rather than obvious. Git checks these files out with
+    CRLF on Windows and LF on a Linux runner, so the same commit produced two
+    different archives: `--check` passed locally and reported every skill STALE
+    in CI, on a tree nobody had edited.
+
+    The fixed timestamp and pinned compression level above already exist to
+    make the archive byte-identical everywhere. They are pointless if the
+    INPUT differs, which it silently did.
+    """
+    return path.read_bytes().replace(b"\r\n", b"\n")
+
+
 def build_archive(name: str) -> bytes:
     """Return the deterministic archive bytes for one skill."""
     skill_md = SRC / name / "SKILL.md"
@@ -46,7 +62,7 @@ def build_archive(name: str) -> bytes:
         raise SystemExit(f"missing source: {skill_md}")
 
     members: list[tuple[str, bytes]] = [
-        (f"{name}/SKILL.md", skill_md.read_bytes())
+        (f"{name}/SKILL.md", _normalised(skill_md))
     ]
 
     ref = REFERENCES.get(name)
@@ -54,7 +70,7 @@ def build_archive(name: str) -> bytes:
         ref_path = ROOT / ref
         if not ref_path.is_file():
             raise SystemExit(f"missing reference document: {ref_path}")
-        members.append((f"{name}/references/{ref}", ref_path.read_bytes()))
+        members.append((f"{name}/references/{ref}", _normalised(ref_path)))
 
     import io
 

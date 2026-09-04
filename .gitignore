@@ -27,6 +27,9 @@ microservices/product/product.exe
 .next/
 out/
 dist/
+# Incremental typecheck cache, written by `tsc --noEmit`. A build artifact, and
+# committing it makes every CI typecheck produce a spurious diff.
+*.tsbuildinfo
 
 # --- local data & runtime ----------------------------------------------------
 /data/
