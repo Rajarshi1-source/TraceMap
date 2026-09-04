@@ -1300,6 +1300,27 @@ Re-verified against the same failure rather than trusted to its unit tests:
 every poll from t+60s to t+154s returned 200 from `last-good` with a truthful,
 growing age, where each one had been a 500 before.
 
+**The fix needed a second pass — F40b.** The first version wrote both keys in
+one unconditional pipeline. An empty graph is a *truthful* statement about now
+and a *useless* fallback, and writing it to both keys silently destroys what the
+fix exists to provide. The failure lands exactly when the fallback matters most:
+ClickHouse comes back, the roll-up views have not caught up, the builder's next
+cycle **succeeds** and returns zero edges, and that empty result overwrites the
+last real graph — leaving the operator an empty map, indistinguishable from a
+system with no traffic, while they are trying to find out what broke.
+
+`graph:current` is still unconditional, because it is the truth about now.
+`graph:lastgood` is written only when the graph has edges. The consequence to
+accept is that after a genuinely quiet hour last-good holds an hour-old graph,
+which is correct and safe because it is served with `stale`, `degraded` and its
+real age. **A last-known-good that a degenerate result can overwrite is not a
+last-known-good.**
+
+Found by re-auditing the fix rather than by a second failure — which is the same
+lesson one level up: F40 itself was two behaviours that were individually correct
+and wrong together. `test_graph_cache.py` pins it and was checked red against the
+unconditional write first; four of its five assertions fail on the old code.
+
 ---
 
 ### F41 — 🔴 Per-call rows carried the whole service pair's blame — FIXED

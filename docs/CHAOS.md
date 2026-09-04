@@ -155,6 +155,25 @@ mid-incident loses the last known shape of their system at the moment they most
 want it. Age and `degraded` ride in the payload so nothing can be mistaken for
 current.
 
+> **The fix needed a second pass, and the reason is worth reading.** The first
+> version wrote both keys in one unconditional pipeline. But an empty graph is a
+> *truthful* statement about now and a *useless* fallback — and written to both
+> keys it silently destroys the thing this whole fix exists to provide.
+>
+> The failure lands exactly when the fallback matters most: ClickHouse comes
+> back, the roll-up views have not caught up, the builder's next cycle
+> **succeeds** and returns zero edges, and that empty result overwrites the last
+> real graph. The operator is then shown an empty map — indistinguishable from a
+> system with no traffic — while trying to find out what broke.
+>
+> `graph:current` is still written unconditionally. `graph:lastgood` is written
+> only when the graph has edges. **A last-known-good that a degenerate result
+> can overwrite is not a last-known-good.**
+>
+> This was found by re-auditing the fix, not by a second failure — which is the
+> same lesson one level up: F40 itself was two behaviours that were individually
+> correct and wrong together.
+
 503 is reserved for genuinely having nothing, and its body says which layer
 failed rather than leaving the dashboard to render a generic error.
 
