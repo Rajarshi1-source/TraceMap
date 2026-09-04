@@ -47,6 +47,7 @@ import yaml
 
 from eval.injectors import assert_all_clear, clear_all, get_injector
 from eval.scorer import FALSE_NEGATIVE, FALSE_POSITIVE, TRUE_POSITIVE, WRONG_EDGE, Scores, score_run
+from eval.topology import CRIT_P99_BASELINE_MS, THRESHOLD_MS
 
 log = logging.getLogger("eval.runner")
 
@@ -142,6 +143,30 @@ class Api:
                 counts[f"{src}->{dst}"] = int(e.get("requestCount")
                                               or e.get("requests") or 0)
         return counts
+
+    async def edge_critical_p99(self) -> dict[str, float]:
+        """Critical p99 per edge, over the same window the guard uses.
+
+        F42. The scoreboard has to carry the evidence that its own traps were
+        valid. Two full runs were scored against a decoy leg that was
+        measurably carrying blame, and finding that out required reading a CI
+        log line by line -- the run artifact itself said nothing, so nothing
+        about the score revealed that two of its failures were the harness.
+
+        A number is not a measurement unless you can tell afterwards what it
+        was measuring.
+        """
+        async with httpx.AsyncClient(timeout=API_TIMEOUT_S) as c:
+            r = await c.get(f"{self.base}/api/graph", params={"window": 5})
+            r.raise_for_status()
+            data = r.json()
+        out: dict[str, float] = {}
+        for e in data.get("edges", []):
+            src = e.get("source") or e.get("src")
+            dst = e.get("target") or e.get("dst")
+            if src and dst:
+                out[f"{src}->{dst}"] = float(e.get("critP99") or 0.0)
+        return out
 
     async def healthy(self) -> bool:
         try:
@@ -550,6 +575,32 @@ async def persist(run_id: str, git_sha: str, tier: str,
         await store.close()
 
 
+def invalid_decoy_traps(measured: dict[str, float]) -> list[str]:
+    """Which declared decoy legs are observably carrying blame right now.
+
+    F42. A leg declared as a zero-blame parallel sibling that is MEASURED at or
+    above the detector threshold cannot be a decoy at any injected delay, so
+    every case naming it in `must_not_alert` is asserting something false and
+    will score a correct detector as wrong.
+
+    Extracted from `main_async` so it can be tested without a stack. The bug
+    this replaces lived for two full runs precisely because the equivalent
+    check was buried where nothing exercised it.
+
+    Legs declared at or above the threshold are skipped: they were never
+    claimed to be decoys, so there is nothing to invalidate.
+    """
+    out: list[str] = []
+    for edge, declared in sorted(CRIT_P99_BASELINE_MS.items()):
+        if declared >= THRESHOLD_MS:
+            continue
+        obs = measured.get(edge)
+        if obs is not None and obs >= THRESHOLD_MS:
+            out.append(f"{edge} measured {obs:.1f}ms critical p99 against a "
+                       f"declared {declared:.1f}")
+    return out
+
+
 async def main_async(args: argparse.Namespace) -> int:
     cases = load_cases(args.tier, args.case)
     api = Api(args.api)
@@ -560,6 +611,27 @@ async def main_async(args: argparse.Namespace) -> int:
     run_id = str(uuid.uuid4())
     log.info("run %s  tier=%s  cases=%d  sha=%s", run_id[:8], args.tier,
              len(cases), args.git_sha[:9] or "local")
+
+    # Snapshot the shape of the graph BEFORE any fault is injected, and decide
+    # from the measurement -- not from the declaration -- whether the decoy
+    # traps this run is about to assert are valid (F42). Recorded either way:
+    # a run whose traps were invalid is not deleted, it is labelled, so the
+    # score and the reason it cannot be trusted travel together.
+    topology_at_start: dict[str, float] = {}
+    invalid_traps: list[str] = []
+    try:
+        topology_at_start = await api.edge_critical_p99()
+        invalid_traps = invalid_decoy_traps(topology_at_start)
+    except Exception as exc:  # noqa: BLE001 - a missing snapshot must not stop
+        # a ninety-minute run; it just means this scoreboard cannot self-audit,
+        # and the artifact says so rather than implying validity.
+        log.warning("could not snapshot topology: %s", exc)
+
+    if invalid_traps:
+        log.warning("TRAPS INVALID -- %s", "; ".join(invalid_traps))
+        log.warning("every case naming those edges in must_not_alert is "
+                    "asserting something false; this scoreboard measures the "
+                    "harness as much as the detector")
 
     results: list[dict] = []
     aborted: str | None = None
@@ -613,6 +685,10 @@ async def main_async(args: argparse.Namespace) -> int:
     payload = {"run_id": run_id, "git_sha": args.git_sha, "tier": args.tier,
                "recorded": recorded, "detector_cfg": detector_config(),
                "aborted": aborted, "cases_expected": len(cases),
+               # F42: the score and its own validity travel together.
+               "topology_at_start": topology_at_start,
+               "traps_valid": not invalid_traps,
+               "invalid_traps": invalid_traps,
                "scores": scores.as_dict(), "cases": results}
     # Two small synchronous writes at the very end of a ~90-minute run, after
     # every case has finished. Reaching for aiofiles here would add a
