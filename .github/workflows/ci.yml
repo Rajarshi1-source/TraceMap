@@ -134,7 +134,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [gateway, order, user, payment, product]
+        # platform and dashboard are here because deploy.yml SHIPS them. The
+        # matrix used to cover only the five microservices, so two of the seven
+        # images that reach production were never scanned -- and the platform
+        # image carries the same base and the same CVEs the microservices do.
+        # A scan gate that misses what it deploys is a gate with a hole in it.
+        include:
+          - { service: gateway,   context: microservices/gateway }
+          - { service: order,     context: microservices/order }
+          - { service: user,      context: microservices/user }
+          - { service: payment,   context: microservices/payment }
+          - { service: product,   context: microservices/product }
+          - { service: platform,  context: platform }
+          - { service: dashboard, context: dashboard }
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -153,7 +165,7 @@ jobs:
       - uses: docker/build-push-action@v6
         id: img
         with:
-          context: microservices/${{ matrix.service }}
+          context: ${{ matrix.context }}
           push: ${{ github.event_name == 'push' }}
           load: ${{ github.event_name != 'push' }}
           tags: |

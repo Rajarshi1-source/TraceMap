@@ -5,7 +5,12 @@ WORKDIR /app
 RUN groupadd -r app && useradd -r -g app app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Same treatment as the microservices: setuptools upgraded (the interpreter
+# ships 70.3.0, CVE-2025-47273), then pip removed. pip is a build tool, and its
+# VENDORED dependencies carry CVEs nothing here imports -- msgpack 1.1.2 lives
+# at pip/_vendor/msgpack and is not an installed package, so no requirements
+# pin could reach it. These workers run `python -m workers.*`.
+RUN pip install --no-cache-dir --upgrade "setuptools>=78.1.1"  && pip install --no-cache-dir -r requirements.txt  && pip uninstall -y pip setuptools >/dev/null 2>&1 || true  && rm -rf /usr/local/lib/python3.14/site-packages/pip            /usr/local/lib/python3.14/site-packages/pip-*            /usr/local/lib/python3.14/site-packages/setuptools            /usr/local/lib/python3.14/site-packages/setuptools-*            /usr/local/lib/python3.14/site-packages/pkg_resources            /usr/local/lib/python3.14/ensurepip
 
 COPY --chown=app:app . .
 USER app

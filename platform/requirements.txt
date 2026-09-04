@@ -1,7 +1,11 @@
 httpx==0.28.1
 prometheus-client==0.24.0
-fastapi==0.121.2
+# 0.141.1: the older pin resolves starlette 0.49.3 (CVE-2026-48818,
+# CVE-2026-54283). Matches the microservices.
+fastapi==0.141.1
 uvicorn[standard]==0.38.0
 redis==6.4.0
 psycopg[binary,pool]==3.2.10
-aiohttp==3.13.2
+# 3.14.3: 3.13.2 carries CVE-2025-69223 (auto_decompress) and CVE-2026-69244
+# (DoS via malformed HTTP). Used by the deploy watcher's control plane.
+aiohttp==3.14.3
