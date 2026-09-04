@@ -68,17 +68,42 @@ class Cache:
 
     # ---- graph ------------------------------------------------------------
     async def put_graph(self, graph: dict[str, Any]) -> None:
-        """Write both copies in one round trip.
+        """Write current always; write last-good only if the graph is good.
 
-        Same payload, two TTLs. A pipeline rather than two awaits so a builder
-        cycle cannot be interrupted between them and leave last-good newer than
-        current, which would make the age arithmetic read backwards.
+        Two TTLs, and -- the part that took a second pass to get right -- two
+        different conditions.
+
+        `graph:current` is written unconditionally, because an empty graph is a
+        truthful statement about now: traffic really may have stopped.
+
+        `graph:lastgood` is written ONLY when the graph has edges. The first
+        version of this method wrote both unconditionally, which quietly
+        destroyed the thing F40 exists to provide. The failure is worst exactly
+        when it matters most: ClickHouse comes back after an outage, the
+        roll-up views have not caught up yet, the builder's next cycle succeeds
+        and returns zero edges -- and that empty result overwrites the last real
+        graph an operator had. They would then be shown an empty map, which is
+        indistinguishable from a system with no traffic, at the moment they are
+        trying to find out what broke.
+
+        A last-known-good that a degenerate result can overwrite is not a
+        last-known-good.
+
+        The consequence to accept: after a genuinely quiet hour, last-good holds
+        an hour-old graph. That is correct and it is safe, because it is served
+        with `stale`, `degraded` and its real age -- an hour-old graph labelled
+        an hour old beats an empty one labelled nothing.
+
+        A pipeline rather than two awaits, so a builder cycle cannot be
+        interrupted between the writes and leave last-good newer than current,
+        which would make the age arithmetic read backwards.
         """
         graph["computedAt"] = time.time()
         blob = json.dumps(graph)
         pipe = self.redis.pipeline()
         pipe.set(GRAPH_KEY, blob, ex=GRAPH_TTL_S)
-        pipe.set(GRAPH_LAST_GOOD_KEY, blob, ex=LAST_GOOD_TTL_S)
+        if graph.get("edges"):
+            pipe.set(GRAPH_LAST_GOOD_KEY, blob, ex=LAST_GOOD_TTL_S)
         await pipe.execute()
 
     def _hydrate(self, raw: str, *, degraded: bool = False) -> dict[str, Any]:
