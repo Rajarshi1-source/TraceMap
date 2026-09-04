@@ -32,19 +32,22 @@ by design.
 >
 > Three things are honestly open, and each links to where it is written up.
 >
-> The **eval gate is red** — precision 0.500 over two full twelve-case runs on
-> CI, against a 0.870 floor. Recall is 1.000 in both, with zero false negatives
-> across twenty-four case executions, and MTTD p95 is stable at 213/214 s
-> against a 432 s ceiling. Two of the six failures turned out to be the
-> *harness* being wrong about the host rather than the detector being wrong
-> (**F42**), which is written up in [`docs/EVAL.md §9`](docs/EVAL.md) along with
-> why the fix is to repair the measurement and re-run, not to move the floor.
+> The **eval gate is red**: precision 0.500 over three full twelve-case runs on
+> CI, against a 0.870 floor. Recall is 1.000 in every run, with **zero false
+> negatives across thirty-six case executions**, and MTTD p95 clears its ceiling
+> every time. The third run is the one that counts — its traps were *verified
+> valid before the cases ran*, after a harness defect (**F42**) invalidated the
+> first two. The remaining cause is **F43**: a flat 50 ms threshold makes the
+> largest-baseline edge the twitchiest, so the edge that absorbs the whole
+> subtree false-positives on a null case with nothing injected.
+> [`docs/EVAL.md §9`](docs/EVAL.md) has all three runs and why the fix is not to
+> raise the number.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
 >
-> Forty-two defects are logged in
-> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), four of them found in
+> Forty-three defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), five of them found in
 > Phase 8 by running the system rather than reading it.
 
 ---

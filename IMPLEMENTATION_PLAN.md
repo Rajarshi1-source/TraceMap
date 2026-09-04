@@ -700,9 +700,9 @@ nobody should trust.
 
 ## 2h. Found while building (Phases 7–8)
 
-Twenty findings. **Eleven in the harness, two in the detector, two in the
-environment it needs, four found in Phase 8 by running the system rather than
-reading it, and one still open (F38)** — which is the phase working as intended.
+Twenty-one findings. **Eleven in the harness, three in the detector, two in the
+environment it needs, five found in Phase 8 by running the system rather than
+reading it, and two still open (F38, F43)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
 detector as broken.
@@ -720,6 +720,9 @@ different kind of exercise and none by a test:
 - **F42** — the guard protecting the golden set's central assumption was reading
   a hardcoded dict, so it could not fail. Found by reading the CI log of a run
   that had already gone red for what looked like a different reason.
+- **F43** — a flat 50ms threshold makes the largest-baseline edge the twitchiest,
+  so it false-positives on a null case with nothing injected. Only became
+  legible once F42 was fixed and a run produced a trustworthy number.
 
 Three deserve reading even if the rest are skipped. **F28** is a gate a correct
 detector could never pass. **F30** is a decoy that punished the detector for
@@ -1483,6 +1486,85 @@ Re-measuring `CRIT_P99_BASELINE_MS` on the runner and picking the leg that is
 genuinely blameless there is the next step, and it must be a measurement rather
 than a choice. Until then the full-tier scoreboard from a GitHub runner carries
 an asterisk, and `docs/EVAL.md` says so.
+
+---
+
+### F43 — 🔴 A fixed absolute threshold makes the biggest edge the twitchiest — OPEN
+
+Three full-set runs, the third with **provably valid traps**, and the same edge
+is the blamed one in four of six failures — including both null cases, one of
+which injects nothing and holds steady load.
+
+```
+null_baseline            false_positive   gateway-svc->order-svc   (nothing injected)
+null_traffic_ramp        false_positive   gateway-svc->order-svc   (F38)
+user_cpu_saturation      wrong_edge       gateway-svc->order-svc
+payment_db_down          wrong_edge       gateway-svc->order-svc
+```
+
+`gateway-svc->order-svc` absorbs `order-svc`'s entire subtree by design — 735.0
+in the specification test, because the gateway really did wait 735 ms on order.
+It therefore carries **the largest baseline and the largest absolute jitter** of
+any edge in the graph.
+
+The breach test is a flat constant:
+
+```python
+threshold_ms: float = 50.0    # the brief's ">50ms" requirement
+breached = delta > cfg.threshold_ms
+```
+
+Fifty milliseconds is an enormous signal on an edge whose baseline is 30 ms. On
+an edge whose baseline is ~290 ms and swinging with host contention it sits
+**inside the noise**. So the edge with the biggest numbers breaches most easily,
+which is precisely backwards.
+
+**The measurement that shows it.** Same code, same window, two hosts — from the
+topology snapshots taken on quiet traffic before any fault:
+
+| edge | this laptop | CI runner (run 3) |
+|---|---|---|
+| `order-svc->payment-svc` | ~148 ms | **289.1 ms** |
+| `order-svc->product-svc` | ~48 ms | 48.3 ms |
+| `order-svc->user-svc` | 0.0 ms | 0.0 ms |
+
+The runner is roughly twice as slow on the critical path and far noisier. Locally
+the null cases pass; on CI they do not. Nothing about the detector changed
+between those two observations — only the magnitude and variance of the numbers
+it is thresholding.
+
+**Why this was not visible until now.** Runs 1 and 2 were scored against an
+invalid decoy (F42), so their false positives had an obvious alternative
+explanation and this pattern sat underneath it. Run 3 removed that explanation:
+the decoy measured exactly 0.0, the guard asserted it on measurement, and
+precision was still 0.500. Fixing the harness is what made the detector defect
+legible.
+
+**What the fix looks like.** The breach test has to judge an edge against
+*itself* rather than against a constant borrowed from the brief — a threshold
+proportional to the edge's own baseline, or a multiple of its observed
+variability, with the absolute 50 ms retained as a floor so a fast edge cannot
+become hypersensitive. The EWMA already tracks the level; tracking dispersion
+alongside it is the natural shape.
+
+**Deliberately not fixed in this pass, and the reason is the same as F38.**
+Choosing between "proportional to baseline" and "multiple of observed sigma",
+and choosing the coefficient, cannot be done from an argument — that is M8, and
+M8 is the load-bearing claim of this whole phase. The case that measures it now
+runs, produces a trustworthy number, and records the topology it was measured
+against. The number comes first, then the threshold.
+
+**Note what must not be done.** Raising 50 to 80 would clear several of these
+cases and is the wrong fix twice over: it makes the detector deafer on every
+edge to quieten one, and it is a threshold changed to clear a gate, which is the
+exact behaviour the eval set exists to prevent. A precision of 0.500 that is
+honestly reported is worth more than a 0.9 obtained that way.
+
+**Related.** F38 (load versus regression) and `docs/LIMITATIONS.md` caveat 7
+(parent edges echoing their children) are the other two explanations for
+`gateway-svc->order-svc` alerting, and all three are the same shape: an edge
+alerting when it should not. It is plausible that a baseline-relative threshold
+moves several of them at once. Plausible is not measured.
 
 ---
 
