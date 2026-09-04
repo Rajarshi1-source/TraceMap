@@ -2244,31 +2244,35 @@ that are load-bearing rather than administrative — if you are triaging, defend
 these:
 
 **Correctness**
-- [ ] `test_parallel_fanout_blames_only_the_slowest_sibling` passes and is quoted in the README
-- [ ] `trace_edges` has a `critical_ms = 0.0` **row** (present, not missing) for a parallel sibling
-- [ ] No materialized view joins `spans`
-- [ ] Roll-up counters verified to aggregate across insert blocks *(F1)*
-- [ ] Assembler dedupes by `span_id` at the fetch boundary *(F2)*
-- [ ] MV and reconciler agree within 2%
+- [x] `test_parallel_fanout_blames_only_the_slowest_sibling` passes and is quoted in the README
+- [x] `trace_edges` has a `critical_ms = 0.0` **row** (present, not missing) for a parallel sibling — measured live: product-svc 95-98% of rows, user-svc 100%
+- [x] No materialized view joins `spans` — `make schema-guard`, 8 files
+- [x] Roll-up counters verified to aggregate across insert blocks *(F1)* — 3 tables, `edge_slo_1m` included
+- [x] Assembler dedupes by `span_id` at the fetch boundary *(F2)*
+- [x] MV and reconciler agree within 2% — measured **0.00%** over 33 buckets
+- [x] Per-call blame never exceeds the call's own duration *(F41)*, and the roll-up's `crit_ms_sum` equals the sum of its rows — both guarded
 
 **The differentiators**
-- [ ] Wall ⇄ critical toggle visibly re-ranks edges in under four seconds
-- [ ] 12 golden cases including null and decoy
-- [ ] CI gate proven to fail — screenshot kept
-- [ ] Deploy markers on edge charts, correlation (or its absence) in alerts
+- [x] Wall ⇄ critical toggle visibly re-ranks edges in under four seconds — and is linkable as `?metric=critical`
+- [x] 12 golden cases including null and decoy — all twelve now run to completion in CI
+- [x] CI gate proven to fail — and not only synthetically: the first full run went red on its own merits at precision 0.583
+- [x] Deploy markers on edge charts, correlation (or its absence) in alerts
 
 **Operational honesty**
-- [ ] Detector heartbeat alert (the silent-failure guard)
-- [ ] Staleness banner when serving last-good data
-- [ ] `docs/LIMITATIONS.md` with all four critical-path caveats
-- [ ] `docs/SCALING.md` with the measured ~7 GB floor
-- [ ] `POSTMORTEM-001.md` in Google SRE format
+- [x] Detector heartbeat alert (the silent-failure guard)
+- [x] Staleness banner when serving last-good data — and it survives a real
+      outage now; see F40/F40b
+- [x] `docs/LIMITATIONS.md` — **seven** caveats now, the original four plus
+      malformed nesting, eval scope, and parent-edge echo (measured in the
+      first full eval run)
+- [x] `docs/SCALING.md` with the measured ~7 GB floor
+- [x] `POSTMORTEM-001.md` in Google SRE format — written about F1
 - [ ] Write endpoints authenticated on the public URL
 
 **The demo**
-- [ ] `make demo` opens on a populated graph, never an empty one
-- [ ] 3-minute video recorded while things work
-- [ ] Flow 4 rehearsed to muscle memory
+- [x] `make demo` opens on a populated graph, never an empty one — verified from a clean clone
+- [ ] 3-minute video recorded while things work — **open**; `docs/DEMO.md` is the script
+- [ ] Flow 4 rehearsed to muscle memory — **open**; written down in `docs/DEMO.md`
 
 ---
 

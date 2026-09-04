@@ -169,6 +169,42 @@ honest framing is that rather than "my detector has an F1 of 0.9".
 
 ---
 
+## 7. A parent edge absorbs its children, and nothing suppresses the echo
+
+The attribution is correct here and the *presentation* is not, which makes this
+the subtlest entry in the document.
+
+`gateway-svc→order-svc` is credited with `order-svc`'s entire subtree — 735.0 ms
+in the specification test, because the gateway really did wait 735 ms on order.
+That is the right answer to "how much did this dependency cost the user". It also
+means **any** downstream degradation raises the parent too, and in steady state
+that edge owns roughly 52% of the critical path on this topology.
+
+So when `payment-svc` degrades, two edges legitimately move: the one that broke
+and the one containing it. Both are true. Only one is actionable.
+
+**Measured, not theorised.** In the first full twelve-case eval run,
+`gateway-svc→order-svc` was the blamed edge in three of five failures. Two of
+those — `user_cpu_saturation` and `payment_db_down` — were scored `wrong_edge`
+because the parent surfaced *instead of* the child that explains it. A single
+alert taken as "the answer" points at the gateway rather than the culprit.
+
+**Why it is not simply a bug.** Suppressing parents unconditionally would be
+wrong: `gateway_latency_cascade` is a case where the gateway edge genuinely *is*
+the finding, and the correct answer is the parent. The distinction is whether the
+parent's increase is *fully explained* by a child's in the same window — which is
+a real comparison to implement, not a flag to set.
+
+**Open.** The fix is parent suppression conditioned on that comparison, and
+choosing its threshold without an eval run to justify it is M8. The case that
+measures it exists and now runs; the number comes first.
+
+Related but distinct: **F38** covers a parent edge that is slow for a legitimate
+reason (offered load rising), which is a different question with a different
+answer — normalising against throughput rather than against a child.
+
+---
+
 ## What this means for the claim
 
 The defensible statement is narrow:
@@ -193,3 +229,4 @@ where it *is* true worth believing.
 | 4 | Clock skew | **Implemented** (2 ms floor); skew not yet measured |
 | 5 | Malformed nesting | **Fixed and tested**, both directions |
 | 6 | Eval scope | Measured; one topology, one traffic mode, quiet-host requirement documented |
+| 7 | Parent edges echo their children | **Open.** Measured: 3 of 5 failures in the first full eval run. Attribution correct, presentation not |

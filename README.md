@@ -283,8 +283,9 @@ number, never "caused by" (M21).
 
 The parts that are easy to skip and are the reason to trust the rest.
 
-- **[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)** — the four conditions under
-  which the flagship number is wrong. Volunteer these before being asked.
+- **[`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)** — the seven conditions under
+  which the flagship number is wrong or misleading, three of them found after the
+  original four were written. Volunteer these before being asked.
 - **[`docs/CHAOS.md`](docs/CHAOS.md)** — ClickHouse killed under live load. Zero
   span loss across a 131-second outage, `/healthz` up while `/readyz` was down —
   and a **falsified** hypothesis: the staleness banner survived only 30 seconds
