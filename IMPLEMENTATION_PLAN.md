@@ -698,12 +698,25 @@ nobody should trust.
 
 ---
 
-## 2h. Found while building (Phase 7)
+## 2h. Found while building (Phases 7–8)
 
-Sixteen findings. **Eleven in the harness, two in the detector, two in the environment it needs, and one still open (F38)** — which is the
-phase working as intended. An eval suite that has never failed is evidence of
-an untested harness, not of a working detector, and four of these were found by
-the harness scoring a correct detector as broken.
+Nineteen findings. **Eleven in the harness, two in the detector, two in the
+environment it needs, three found in Phase 8 by running the system rather than
+reading it, and one still open (F38)** — which is the phase working as intended.
+An eval suite that has never failed is evidence of an untested harness, not of a
+working detector, and four of these were found by the harness scoring a correct
+detector as broken.
+
+The three from Phase 8 are worth separating, because each was found by a
+different kind of exercise and none by a test:
+
+- **F39** — a dispatched CI run died in preflight. Two config files that each
+  looked correct alone.
+- **F40** — a chaos experiment falsified a hypothesis this repository had
+  asserted. Two constants that had never been read next to each other.
+- **F41** — the flagship number was wrong on 4.83% of rows on the edge that
+  matters most, and every average looked fine. Found by checking an invariant
+  against live data on a hunch.
 
 Three deserve reading even if the rest are skipped. **F28** is a gate a correct
 detector could never pass. **F30** is a decoy that punished the detector for
@@ -1200,6 +1213,145 @@ run to justify it is M8. The case that measures it exists and now runs; the
 number comes first, then the threshold.
 
 Recorded open, with the failure reproduced, which is the honest position.
+
+### F39 — 🟠 The eval workflow and the eval overlay disagreed about where the datastores are — FIXED
+
+`docker-compose.eval.yml` republishes Redis on **56379** and Postgres on
+**55432**, deliberately: on a developer machine a native service frequently
+already owns the default port, compose publishes the container anyway, reports
+success, and the runner then talks to the wrong database for a whole
+ninety-minute run. The overlay moved the ports to stop that.
+`.github/workflows/eval.yml` still named the defaults.
+
+**Why nothing noticed for weeks.** A CI runner has no native Redis, so there was
+no bind conflict and nothing failed at boot. All sixteen containers came up
+green, the baselines warmed for six minutes, the topology guard passed — and the
+run died in preflight ten minutes in:
+
+```
+preflight FAILED
+  - redis unreachable at redis://localhost:6379/0 (ConnectionError).
+    Alert suppression cannot be reset between cases, so every repeat-edge
+    case would false-negative.
+```
+
+The runner was right to refuse. Without Redis the suppression reset is a no-op,
+and cases 003 and 006 both fault `order-svc->payment-svc` inside one 600s dedup
+TTL — the second would have been a guaranteed false negative and the scoreboard
+would have been measuring Redis.
+
+**The shape of the defect is the interesting part**: not a crash, but two files
+that each look correct in isolation. Nothing in either one is wrong on its own
+page.
+
+**Fixed** by setting `EVAL_REDIS_PORT`, `EVAL_POSTGRES_PORT`, `REDIS_URL` and
+`POSTGRES_PORT` in the workflow env. GitHub Actions cannot reference one env key
+from another in the same block, so the literals are duplicated — and
+`eval/tests/test_ci_ports.py` is the guard that makes the duplication safe. It
+parses the overlay, the workflow and the Makefile and fails if they stop
+agreeing. It runs in the workflow's own pre-boot validation step, so the same
+drift now fails in **milliseconds instead of after a stack boot**, and it was
+checked red against the exact defect before being committed.
+
+---
+
+### F40 — 🔴 The staleness banner could not survive the outage it was built for — FIXED
+
+Found by chaos experiment 001 (`docs/CHAOS.md`), which stopped ClickHouse under
+live load. The graph API served honest stale data for **thirty seconds** and then
+returned **HTTP 500** for the remaining hundred seconds of the outage, including
+the entire restart.
+
+The arithmetic made it inevitable and was sitting in two constants that had never
+been read next to each other:
+
+```
+GRAPH_TTL_S      60    graph:current expires 60s after the last good build
+STALE_AFTER_S    30    the banner appears at 30s of age
+                 --
+                 30s   the entire life of the staleness banner
+```
+
+Past 60 seconds the key is gone, `/api/graph` falls through to a live ClickHouse
+query, and that query had nothing to talk to. The exception escaped as a 500.
+
+**Measured in the same experiment: ClickHouse took 31 seconds to answer after
+`docker start`**, on a machine where the stack was already warm. Any
+restart-shaped outage — the most ordinary kind there is — outlives a 30-second
+banner by construction. M26 exists so that degraded data beats no data, and the
+feature could not cover the one scenario it was designed for.
+
+Two components, each individually correct, that had never been considered
+together. No unit test would have reached it: everything behaved to
+specification.
+
+**Fixed** with `graph:lastgood`, a second copy under its own key with an hour-long
+TTL, written in the same Redis pipeline as `graph:current` so the two cannot
+disagree about which is newer. `/api/graph` now falls through
+cache → live → last-good → a 503 that names which of the three failed.
+
+Last-good returns **HTTP 200**, deliberately: M26 says never display stale data
+*without the banner*, not never display it. A 503 would be more literal and less
+useful — the dashboard renders nothing and an operator mid-incident loses the
+last known shape of their system at the moment they most want it. Age and
+`degraded` ride in the payload so nothing can be mistaken for current.
+
+Re-verified against the same failure rather than trusted to its unit tests:
+every poll from t+60s to t+154s returned 200 from `last-good` with a truthful,
+growing age, where each one had been a 500 before.
+
+---
+
+### F41 — 🔴 Per-call rows carried the whole service pair's blame — FIXED
+
+The flagship number, wrong on a measurable fraction of rows, for the same reason
+in every case.
+
+`attribute_to_edges` returns one value **per service pair** — the right shape for
+a whole-trace summary. The assembler writes one row **per call**, and was filling
+`critical_ms` from that pair-keyed map. So when `order-svc` calls `payment-svc`
+twice in a trace — a retry, or the saga compensating a charge after a sibling
+failed — **both rows received the pair total**.
+
+Three consequences, in increasing order of how much they matter:
+
+1. `critical_ms > duration_ms` on individual rows. Definitionally impossible: an
+   edge cannot contribute more user-visible time than the call itself took.
+2. `crit_ms_sum` in `service_edges_1m` counted that blame once per row, so the
+   roll-up over-attributed the edge by roughly its call count.
+3. The TDigest behind `crit_p99` was fed the pair total once per call. **The
+   dependency map ranks on `crit_p99`**, so an edge called twice per trace
+   outranked one called once — sending you to the wrong service, which is the
+   exact failure this project exists to prevent, arrived at from the other
+   direction.
+
+**Measured on live data before the fix:**
+
+| | |
+|---|---|
+| `order-svc->payment-svc` rows violating `critical_ms <= duration_ms` | **4.83%** |
+| Its traces making two or more calls | **3.9%** (592 of 15,132) |
+| Overall violation rate across all edges | 1.35% (1,342 of 99,178) |
+| Worst single excess | +1,996 ms |
+
+The most over-blamed edge was the one the flagship exists to identify, because it
+is the only edge with a compensation path. Averages hid it completely — `avg`
+looked plausible throughout — which is why the guard added for it counts **rows**
+rather than comparing means.
+
+**Fixed** by `attribute_to_child_spans`, which returns subtree critical time
+keyed by child span id. `attribute_to_edges` is now *defined in terms of it*, so
+the per-call rows and the per-edge total cannot drift apart again. The
+sub-skew floor moved with it: it is a statement about what a single measurement
+can resolve, so applying it to a sum of calls was testing the wrong quantity.
+
+Verified against live data after the fix: **zero violations** on fresh rows, and
+`make critical-path-guard` now asserts the invariant permanently.
+
+**What this cost.** The full-set eval run that produced precision 0.583 was
+executed against the buggy attribution. That result is recorded in `docs/EVAL.md`
+as it stands, and the set was re-run against the fix rather than the number being
+quietly replaced.
 
 ---
 

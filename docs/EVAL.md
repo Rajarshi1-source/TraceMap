@@ -292,21 +292,41 @@ every latency in the set. This is what dedicated CI hardware buys.
 | `payment_db_down` | wrong edge | `gateway-svc→order-svc`, expected `order-svc→payment-svc` |
 | `gateway_latency_cascade` | false positive | got `gateway-svc→order-svc` **correctly**, and *also* blamed `order-svc→payment-svc` |
 
-**`gateway-svc→order-svc` appears in three of the five.** That edge absorbs
-`order-svc`'s entire subtree by design — it is 735.0 in the specification test,
-because the gateway really did wait 735 ms on order. So *any* downstream
-degradation raises it too. It is not wrong; it is **redundant**. The detector
-reports the parent and the child, and the scorer counts the parent as a wrong
-edge.
+**`gateway-svc→order-svc` appears in three of the five**, and it is worth being
+precise about *why*, because the three are not all the same thing.
 
-Two of the five are the same shape one level down: the right edge *was* found,
-and a second alert on a trap edge cost the case.
+That edge absorbs `order-svc`'s entire subtree by design — it is 735.0 in the
+specification test, because the gateway really did wait 735 ms on order. It also
+owns roughly 52% of the critical path in steady state. So it is genuinely the
+biggest edge in the system, and *any* downstream degradation raises it too.
 
-So the diagnosis is one structural gap, not five unrelated bugs: **there is no
-parent suppression.** When a parent edge's critical-path increase is fully
-explained by a child's in the same window, it is the same finding one level up,
-not an independent one. Alerting on both doubles the noise and, when a single
-alert is taken as "the answer", points at the gateway instead of the culprit.
+**One of the three is a known open defect, not a new finding.**
+`null_traffic_ramp` is **F38**, recorded open in `IMPLEMENTATION_PLAN.md` with
+the failure already reproduced: the detector cannot distinguish a latency rise
+caused by a regression from one caused by load. Offered load doubles, queueing
+raises p99, nothing is wrong, and every existing gate correctly declines to
+fire — the request-count floor is a *minimum*, the ramp *is* sustained, and the
+blame-share gate agrees the edge really is the bottleneck. F38 is deliberately
+unfixed because the fix needs a second EWMA over throughput and a threshold, and
+picking that threshold without an eval run to justify it is M8. The run this
+document reports is the beginning of that number.
+
+**Two are a different gap: the parent alerted instead of the child.** In
+`user_cpu_saturation` and `payment_db_down` the culprit edge was real and
+identifiable, and what surfaced was the parent that contains it. When a parent's
+critical-path increase is fully explained by a child's in the same window it is
+the same finding one level up, not an independent one — and when a single alert
+is taken as "the answer", it points at the gateway instead of the culprit.
+Nothing currently suppresses that.
+
+**Two are co-alerts.** In `parallel_decoy` and `gateway_latency_cascade` the
+right edge *was* found — the decoy case correctly named `order-svc→payment-svc`
+— and a second alert on a trap edge cost the case anyway. Under the scoring
+rules that is correct: an extra alert on an innocent edge costs the same on-call
+hour whether or not a correct alert accompanied it.
+
+So: **one known open defect, one structural gap, and a scoring rule doing its
+job.** Not five unrelated bugs.
 
 ### What was done about it
 
