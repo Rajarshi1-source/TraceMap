@@ -26,7 +26,7 @@ your own database.
 | Bytes on disk, per table | ClickHouse `system.parts` | **measured** |
 | Bytes per row, compression ratio | `system.parts` | **measured** |
 | Span ingest rate | `count()` over `tracemap.spans`, last hour | **measured** |
-| Steady-state disk | bytes/row × spans/day × retention | derived |
+| Steady-state disk | each table's own growth, scaled to its TTL | derived |
 | Host and volume price | D2, env-overridable | configuration |
 
 The ingest rate is counted from the same database as the byte totals, and that
@@ -57,57 +57,105 @@ Charging for the first 80 GB would be charging twice — the CX32 includes it.
 Getting this wrong is the single easiest way to produce a cost model that looks
 authoritative and is inflated by an order of magnitude.
 
-### Steady state is projected per table, not in aggregate
+### Steady state, per table, from each table's own growth
 
-The tables scale on different axes and mixing them is the modelling error worth
-guarding:
+```
+projected(T) = current_bytes(T) × retention_days / min(age_days, retention_days)
+```
+
+Read plainly: this table put down X bytes in N days, so at a TTL of R days it
+holds X·R/N. Once a table is older than its own retention the factor is 1 and
+the projection collapses to its current size — correct, because it is already at
+steady state.
+
+**Why not scale everything by the span rate.** Because the tables do not share
+an axis:
 
 | Table | Scales with | Retention |
 |---|---|---|
 | `otel_spans` (landing) | span volume | 1 day |
 | `spans` | span volume × sample rate | 7 days |
-| `trace_edges`, `trace_critical_path` | edges per trace | 7 days |
+| `trace_edges`, `trace_critical_path` | **traces**, not spans | 7 days |
 | `service_edges_1m`, `service_red_1m`, `edge_slo_1m` | **distinct edges × minutes** | 30 days |
 | `service_edges_recon` | as above | 2 days |
-| `deploy_markers` | deploys | 90 days |
+| `deploy_markers` | **deploys** | 90 days |
 
-The roll-ups are bounded by the topology, not by traffic: five services produce
-a handful of edges, and a 1-minute bucket per edge per minute is the same number
-of rows at 20 rps and at 2000. Projecting them off the span rate overstates them
-by three or four orders of magnitude and produces a model that recommends
-dropping the cheapest and most useful tables in the schema. `test_cost_meter.py`
-pins that.
+The first version of this model classified tables by name and billed everything
+that was not a roll-up as span traffic. Running it produced **`deploy_markers`
+at 3,477 GiB** — ninety days of a table that gains a row per release, priced as
+ninety days of span volume — and turned a €7.05 bill into €191. `trace_critical_path`
+was overstated the same way: one row per trace, projected as one row per span.
+
+Any model that has to guess which axis a table scales on will be wrong about a
+table someone adds later. Measuring each table's own growth needs no taxonomy
+and cannot be wrong about a table it has never seen. `test_cost_meter.py` pins
+the regression.
 
 ---
 
-## 3. Why storage is not the lever — the arithmetic
+## 3. Measured, on this repository
 
-The raw span table is the only thing on this disk that scales with traffic. The
-question is how much traffic it takes to fill the 80 GB the box already
-includes.
+Taken from a live stack, 4 Sep 2026: sixteen containers, 36 hours of history,
+6.9 million spans retained.
+
+| Table | Rows | **Bytes/row** | Compression |
+|---|---|---|---|
+| `spans` | 6,906,413 | **56.33** | **19.9×** |
+| `otel_spans` | 6,897,577 | 49.46 | 13.8× |
+| `trace_critical_path` | 243,649 | 311.26 | 4.3× |
+| `trace_edges` | 906,176 | 35.06 | 2.5× |
+| `service_edges_1m` | 1,364 | 5,022 | 2.1× |
+
+**Fifty-six bytes on disk per span, at nearly twenty-fold compression.** That is
+the number the whole model rests on, and it is what the per-column codecs buy:
+`Delta` on timestamps, `Gorilla` on float durations, `ZSTD` on strings, chosen
+per column rather than globally because a timestamp and a latency compress well
+under different schemes.
+
+The roll-ups look expensive per row — 5 KB — and are irrelevant in aggregate:
+1,364 rows against 6.9 million. That is the topology bound made visible.
+
+### The resulting bill
+
+| | |
+|---|---|
+| Projected steady-state disk | **2.71 GiB** |
+| Disk included with the box | 80 GB |
+| Storage overflow | **0** |
+| **Total monthly** | **€7.05** |
+| Share of the bill that is the box | **100%** |
+| Cost per million spans | €0.0058 |
+
+## 4. Why storage is not the lever — the arithmetic
+
+The raw span table is the only thing on this disk that scales with traffic. So:
+how much traffic before it fills the 80 GB the box already includes?
 
 ```
-spans_per_day_at_breakeven = 80 GB / (bytes_per_row × 7 days)
+spans_per_day_at_breakeven = 80 GB / (56.33 bytes × 7 days)
+                           ≈ 203 million spans/day
 ```
 
-At **200 bytes/row** — a conservative stand-in until your own `/api/cost`
-replaces it with the measured value; the per-column codecs (`Delta` on
-timestamps, `Gorilla` on float durations, `ZSTD` on strings) generally do better
-— that is roughly **57 million spans a day**, or ~660 spans/second sustained.
+The stack above was measured at **40.8 million spans/day** — and that is not the
+quiet demo profile, it is the eval overlay's load generator running hard. **Five
+times that traffic, sustained, before one euro of storage appears on the bill.**
 
-At the demo profile of 20 rps through a five-service checkout, with the 20%
-probabilistic baseline sample (M14) keeping all errors and slow traces on top,
-storage sits an order of magnitude below that. **You would need something like
-9× the demo's traffic before a single euro of storage appears on the bill.**
+> **A caveat the meter raises about its own numbers.** At the time of that
+> reading the last-hour ingest rate was 8.9× the database's lifetime average,
+> because the load generator had recently started. The projection scales each
+> table from its observed growth, so it *understates* steady state by roughly
+> that factor while the average catches up. `/api/cost` says so in its `caveat`
+> field rather than leaving a reader to notice. Even 8.9× of 2.71 GiB is 24 GiB
+> — still inside the 80.
 
 So the shape of the cost curve is a step function, not a slope:
 
 ```
 €7.05  ├────────────────────────────────────┐
-       │      everything up to ~9x demo     │
-       │        traffic costs the same      └──── then €0.05/GB, gently
+       │   everything up to ~203M spans/day │
+       │        costs exactly the same      └──── then €0.05/GB, gently
        └─────────────────────────────────────────────────────────────►
-                          span volume
+              40.8M measured ▲          203M ▲ breakeven
 ```
 
 Two consequences, and they are the practical output of this whole document:
@@ -125,7 +173,7 @@ CPU on the fan-out service, not disk and not memory.
 
 ---
 
-## 4. What the €7.05 buys, and what it does not
+## 5. What the €7.05 buys, and what it does not
 
 **Included:** five instrumented services, an OpenTelemetry collector with tail
 sampling, Jaeger v2, ClickHouse, PostgreSQL, Redis, the four platform workers,
@@ -147,7 +195,7 @@ a resilience story it does not have. See `docs/LIMITATIONS.md`.
 
 ---
 
-## 5. Against a vendor
+## 6. Against a vendor
 
 The comparison worth making is not a price, because prices move and a number
 quoted here will be stale before anyone reads it. It is the **billing shape**.
@@ -173,7 +221,7 @@ by the bill, because at this scale the bill does not notice.
 cheaper".** It is that the knobs stay attached to the questions they should be
 attached to.
 
-At what scale does that flip? When storage crosses the step — around 9× this
+At what scale does that flip? When storage crosses the step — around 5× this
 traffic on the assumptions above — the arithmetic starts to matter and the
 answer becomes a real comparison rather than a rounding error. The honest
 sentence is that this document describes a €7 deployment and does not pretend to
@@ -181,7 +229,7 @@ have modelled a €7,000 one.
 
 ---
 
-## 6. Watching it
+## 7. Watching it
 
 Prometheus scrapes the cost meter alongside everything else:
 
@@ -209,7 +257,7 @@ how a cost dashboard gets muted within a week.
 
 ---
 
-## 7. Re-deriving this
+## 8. Re-deriving this
 
 Prices are the most volatile facts in this repository. The constants are
 env-overridable for that reason, and the discipline is the same as the version

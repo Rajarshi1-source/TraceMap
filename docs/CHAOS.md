@@ -164,6 +164,25 @@ last-good TTL is more than ten times the *measured* 31-second ClickHouse
 restart, so the fix cannot silently become cosmetic if someone tunes the
 constant later.
 
+### Verified against the same failure
+
+The fix was not accepted on the strength of its unit tests. ClickHouse was
+stopped again, under the same conditions, and the endpoint polled past the cliff
+that used to break it:
+
+| t | Status | Source | `stale` | `degraded` | Age |
+|---|---|---|---|---|---|
+| +15 s | 200 | cache | false | — | 21.5 s |
+| +30 s | 200 | cache | **true** | — | 36.5 s |
+| +45 s | 200 | cache | true | — | 51.5 s |
+| **+60 s** | **200** | **last-good** | **true** | **true** | 70.4 s |
+| +98 s | 200 | last-good | true | true | 108.2 s |
+| +154 s | 200 | last-good | true | true | 164.8 s |
+
+Every row past +60 s was an HTTP 500 before the fix. The age keeps climbing and
+is reported honestly rather than reset, so a viewer can see exactly how far
+behind the data is.
+
 ## 6. Recovery, measured
 
 | | |

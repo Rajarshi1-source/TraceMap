@@ -16,6 +16,23 @@ export default function GraphPanel({ initial }: { initial: Graph }) {
   const [error, setError] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /* The metric mode is addressable as `?metric=critical`.
+   *
+   * Not a convenience: the point of this dashboard is to hand someone the edge
+   * they should go fix, and a view you cannot link to is a view you have to
+   * describe over a call. `?metric=critical` is the shareable form of "it is
+   * not the service you think it is".
+   *
+   * Applied in an effect rather than as the useState initialiser, because the
+   * server has no URL to read and would render "wall" while the client rendered
+   * "critical" -- a hydration mismatch for the sake of one frame. The toggle
+   * owns the value from here on; this only decides where it starts. */
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get("metric") === "critical") {
+      setMode("critical");
+    }
+  }, []);
+
   const load = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/graph`, { cache: "no-store" });

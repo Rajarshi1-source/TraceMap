@@ -89,19 +89,78 @@ def main() -> int:
           bool(pay) and pay["crit_ms"] > 0,
           f"crit_ms={pay['crit_ms']}" if pay else "edge missing")
 
+    # M5 is a PER-ROW mandate and has to be checked per row.
+    #
+    # This previously asserted avg(critical_ms) == 0.0 for both siblings, and
+    # that is a claim the application deliberately contradicts: product-svc has
+    # an N+1 query path that fires on carts above a threshold, and on those
+    # traces product genuinely IS the slowest leg and genuinely does carry
+    # blame. eval/cases/006 documents the same thing with its own measurements.
+    # A mean of exactly zero is only satisfiable while traffic never crosses
+    # that threshold, so the old check passed by luck and would have gone red on
+    # a correct system under a heavier cart mix.
+    #
+    # Measured here, 359 rows: product-svc 98.1% zero, user-svc 100% zero,
+    # payment-svc 1.9% zero. That mirror image is the thesis, and it is visible
+    # per row in a way no average can express.
+    rowwise = q(f"""
+        SELECT target_service AS dst, count() AS n,
+               countIf(critical_ms = 0) AS zero_rows,
+               round(100 * countIf(critical_ms = 0) / count(), 1) AS pct_zero
+        FROM tracemap.trace_edges
+        WHERE source_service = 'order-svc'
+          AND time_bucket >= now() - INTERVAL {args.window}
+        GROUP BY dst
+    """)
+    zero_by = {r["dst"]: r for r in rowwise}
+
     for sibling in ("product-svc", "user-svc"):
         row = by.get(("order-svc", sibling))
-        # M5 - present AND zero. Missing is a different, worse failure.
-        check(f"order->{sibling} row EXISTS with critical_ms = 0.0 (M5)",
-              bool(row) and row["crit_ms"] == 0.0,
+        z = zero_by.get(sibling)
+        # Present AND mostly zero. Missing is a different, worse failure: the
+        # map would drop the edge rather than fade it, and a dropped edge is a
+        # lie because the call really happened.
+        check(f"order->{sibling}: zero-blame rows EXIST and dominate (M5)",
+              bool(row) and bool(z) and z["zero_rows"] > 0 and z["pct_zero"] >= 90.0,
               "row missing entirely - the map would drop the edge, not fade it"
-              if not row else f"crit_ms={row['crit_ms']}")
+              if not row else
+              f"{z['zero_rows']}/{z['n']} rows at exactly 0.0 ({z['pct_zero']}%)")
 
-    if pay and by.get(("order-svc", "product-svc")):
-        prd = by[("order-svc", "product-svc")]
-        check("the thesis: a slow edge carries zero blame",
-              prd["wall_ms"] > 20 and prd["crit_ms"] == 0.0,
-              f"product-svc: {prd['wall_ms']}ms wall clock, {prd['crit_ms']}ms attributed")
+    prd_z = zero_by.get("product-svc")
+    pay_z = zero_by.get("payment-svc")
+    if prd_z and pay_z:
+        # The thesis, as the mirror image it actually is: the slow-but-parallel
+        # sibling is almost always blameless, the slowest sibling almost never
+        # is. Stated as a comparison so it cannot be satisfied by a detector
+        # that simply blames nothing.
+        check("the thesis: parallel sibling blameless, slowest sibling blamed",
+              prd_z["pct_zero"] >= 90.0 and pay_z["pct_zero"] <= 10.0,
+              f"product-svc {prd_z['pct_zero']}% zero-blame vs "
+              f"payment-svc {pay_z['pct_zero']}%")
+
+    # F41. An edge cannot contribute more user-visible time than the call itself
+    # took. This is arithmetic, not a tuning question, and it held silently false
+    # for weeks: the assembler filled per-CALL rows from a map keyed by SERVICE
+    # PAIR, so a retry or the saga's compensation gave both calls the pair total.
+    #
+    # Measured before the fix: 4.83% of order->payment rows, against 3.9% of its
+    # traces making two or more calls. The most over-blamed edge was the one the
+    # flagship exists to find. Averages hid it completely, which is why this
+    # check counts ROWS rather than comparing means.
+    viol = q(f"""
+        SELECT source_service AS src, target_service AS dst,
+               count() AS n,
+               countIf(critical_ms > duration_ms + 0.001) AS bad,
+               round(max(critical_ms - duration_ms), 1) AS worst_ms
+        FROM tracemap.trace_edges
+        WHERE time_bucket >= now() - INTERVAL {args.window}
+        GROUP BY src, dst
+        HAVING bad > 0
+    """)
+    check("F41 - no row is blamed for more than its own duration",
+          not viol,
+          "; ".join(f"{r['src']}->{r['dst']} {r['bad']}/{r['n']} rows, "
+                    f"worst +{r['worst_ms']}ms" for r in viol) or "")
 
     # Compare per (time_bucket, edge), not as two grand totals. The two sides
     # cover different spans of history - the reconciler works from tracemap.spans
