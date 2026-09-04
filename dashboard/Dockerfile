@@ -16,8 +16,10 @@ ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
 FROM node:24-alpine AS runtime
-# OS security fixes published since the base tag was cut (see gateway).
-RUN apk upgrade --no-cache
+# OS security fixes published since the base tag was cut, and npm removed --
+# it is a build tool, and three HIGH CVEs live in its bundled dependencies.
+# Next.js standalone runs `node server.js` and never shells out to npm.
+RUN apk upgrade --no-cache  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 WORKDIR /app
 RUN addgroup -S app && adduser -S app -G app
 # HOSTNAME=0.0.0.0 is NOT optional. Next's standalone server.js binds to

@@ -5,8 +5,17 @@ WORKDIR /app
 RUN groupadd -r app && useradd -r -g app app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-
+# setuptools is upgraded before anything else: the base image ships 70.3.0,
+# which carries CVE-2025-47273 (path traversal). It is not in requirements.txt
+# because nothing here imports it -- it arrives with the interpreter, and an
+# image inherits its base's CVEs whether or not it uses the package.
+#
+# pip is then REMOVED, for the same reason npm is removed from the Node images:
+# it is a build tool in a runtime image, and its VENDORED dependencies carry
+# CVEs the application never imports. msgpack 1.1.2 (GHSA-6v7p-g79w-8964) lives
+# at pip/_vendor/msgpack and is not installed as a package at all, so no
+# requirements pin could ever have fixed it. This service runs uvicorn.
+RUN pip install --no-cache-dir --upgrade "setuptools>=78.1.1"  && pip install --no-cache-dir -r requirements.txt  && pip uninstall -y pip setuptools >/dev/null 2>&1 || true  && rm -rf /usr/local/lib/python3.14/site-packages/pip            /usr/local/lib/python3.14/site-packages/pip-*            /usr/local/lib/python3.14/site-packages/setuptools            /usr/local/lib/python3.14/site-packages/setuptools-*            /usr/local/lib/python3.14/site-packages/pkg_resources            /usr/local/lib/python3.14/ensurepip
 COPY --chown=app:app . .
 USER app
 

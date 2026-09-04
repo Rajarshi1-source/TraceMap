@@ -15,7 +15,13 @@ WORKDIR /app
 # flagged libcrypto3 3.5.7-r0 (CVE-2026-14456) against a base tag that had not
 # been rebuilt yet; pinning the base and never upgrading means the image's CVE
 # count only ever grows between tag bumps.
-RUN apk upgrade --no-cache && addgroup -S app && adduser -S app -G app
+# npm is a BUILD tool and this is a runtime image. Removing it drops three
+# HIGH CVEs that live in npm's own bundled dependencies -- brace-expansion,
+# ip-address and tar under /usr/local/lib/node_modules/npm -- none of which
+# this service ever imports. They survived the switch to `npm ci` precisely
+# because they were never in the application's dependency tree; they ship with
+# the base image. `node server.js` needs the runtime, not the package manager.
+RUN apk upgrade --no-cache  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx  && addgroup -S app && adduser -S app -G app
 COPY --from=deps --chown=app:app /app/node_modules ./node_modules
 COPY --chown=app:app package.json ./
 COPY --chown=app:app src ./src

@@ -27,7 +27,7 @@ Audit performed 2026-09-02 against commit `abeef8d`.
 | **4 — Critical path ⭐** | ✅ **Done** | 7/7 verified live; product-svc 47ms wall clock, **0ms blame**, row present |
 | **5 — API + dashboard** | ✅ **Done** | 7/7 verified; toggle fades the parallel edge, positions drift 1.14px across polls |
 | **6 — Detector + deploy attribution** | ✅ **Done** | 7/7 verified live; 60ms fault alerted at **375s** — see F19 on the budget |
-| **7 — Eval harness + CI ⭐** | ⚠️ **Built, gate red** | Smoke tier measured: **precision 0.750 / recall 1.000 / F1 0.857, MTTD p50 242s p95 273s**. Null, latency and error cases pass; **decoy fails (F37, open)**. Criterion 4's MTTD ceiling amended (F28). **Criterion 8's live URL not deployed.** No baseline committed — this host cannot time reliably (F36) |
+| **7 — Eval harness + CI ⭐** | ⚠️ **Built, not complete** | 2/8 criteria clean, 3 partial, 3 unmet. Smoke tier: **precision 0.750 / recall 1.000 / F1 0.857, MTTD p50 242s p95 273s** — **decoy fails (F37, open)**. **8 of 12 cases have never run live.** CI green after three rounds of fixes; **live URL not deployed**; no baseline committed (F36) |
 | 8 — Docs + polish | Not started | |
 
 Phase 1 measured: **19.67 req/s, 0.08% error rate, p95 128ms**. Checkout p95 sits
@@ -1666,7 +1666,10 @@ detector; a live HTTPS URL works.
 eval/cases/001..012*.yaml     # incl. 001/002 null, 006 decoy, 011 deploy-correlated
 eval/injectors/{base,latency,error,saturation,dep_kill,null}.py
 eval/runner.py  eval/scorer.py  eval/check_regression.py
-eval/baselines/main.json
+eval/baselines/README.md      # main-<tier>.json, NOT main.json: smoke and full
+                              # are different measurements and the gate refuses
+                              # to compare them. Neither is committed yet - see
+                              # F36 for why this host cannot produce one
 charts/tracemap/              # Helm: probes, PDB, HPA, NetworkPolicy, RBAC
 .github/workflows/{ci.yml, eval.yml, deploy.yml}
 monitoring/prometheus-rules.yml  monitoring/grafana/
@@ -1708,14 +1711,26 @@ baseline. A leaked injector (M29). Dropping the null case to improve the number
 
 | # | Criterion | Evidence |
 |---|---|---|
-| 1 | 12 cases, sequential, one `eval_runs` row | ✅ Verified end to end on the smoke tier: one `eval_runs` row plus four `eval_cases` rows, surfaced as `tracemap_eval_*` gauges on `/metrics` and read by the Phase 7 alert rules. The full 12 have not been run in one pass (~110 min) |
+| 1 | 12 cases, sequential, one `eval_runs` row | ⚠️ **Machinery verified, scale not.** End to end on the smoke tier: one `eval_runs` row plus four `eval_cases` rows, surfaced as `tracemap_eval_*` gauges and read by the Phase 7 rules. But **8 of the 12 cases have never been executed** — 002, 004, 005, 008, 009, 010, 011, 012. They pass their file-level tests and have never faced a live stack |
 | 2 | Decoy passes | ❌ **FAILS, open (F37).** Rebuilt once on a measurement (F30) and still red. A p99 trap is unsatisfiable for any delay big enough to breach the wall-clock threshold — the detector is right, the assertion is not. Not rebuilt a third time: that would be tuning the measurement to the answer |
-| 3 | Null cases pass | ✅ `001_null_baseline` passed on the clean run — no alert across 600s of healthy traffic. Requires a quiet host (F29); it false-positived on a contended one |
+| 3 | Null cases pass | ⚠️ **Half.** `001_null_baseline` passed on the clean run — no alert across 600s of healthy traffic, on a quiet host (F29). `002_null_traffic_ramp` has **never been executed**: it is not in the smoke tier, and the full set has not been run |
 | 4 | F1 ≥ 0.82, precision ≥ 0.87, MTTD p95 | ⚠️ **F1 0.857 ✅, precision 0.750 ❌** (the decoy), MTTD p95 273s ✅. **Ceiling amended 216s → 432s** — 216s sits below the detector's own 3-cycle confirmation floor before any pipeline time (F28) |
 | 5 | The gate is proven to fail | Done twice. A real run went red at F1 **0.400** / precision **0.333**, and `scripts/eval-gate-guard.py` reproduces six distinct breakages in CI on every commit — a test rather than a screenshot |
-| 6 | Storage-profile matrix | `ci.yml` `storage-profile-matrix`, `clickhouse` + `badger`, calling the existing `scripts/profile-matrix.sh` |
-| 7 | k6 SLO gate | `ci.yml` `k6-slo-gate`, p95 < 400ms and error rate < 1% at 50 rps, after a 30s warm-up so the SLO is not a statement about process startup |
+| 6 | Storage-profile matrix | ✅ **Both green in CI.** Took three rounds: scripts were mode 100644 (Windows has no exec bit) so badger died on "Permission denied", and clickhouse then died because Jaeger never waited for the database — it pings ClickHouse once at startup and exits(1), and ClickHouse reported healthy from HTTP 8123 while its consumers use native 9000 |
+| 7 | k6 SLO gate | ✅ **Green, at 10 rps not 50.** Thresholds are exactly as specified (p95 < 400ms, errors < 1%); only the offered load is reduced. A 2 vCPU / 7 GB runner cannot serve this stack's ~7 GB floor at 50 rps — measured p95 2.5s, 2.37% errors, and only 44.7 of the 50 achieved. That is the runner saturating, so gating on it would measure GitHub's hardware. **The 50 rps figure belongs to the sized host and must be quoted from there, not from CI** |
 | 8 | Live HTTPS, writes authenticated | `charts/tracemap/templates/ingress.yaml` — Traefik + cert-manager, write prefixes behind basic auth; `deploy.yml` asserts unauthenticated writes are refused. **Not yet deployed to a live host** |
+
+**Verdict: Phase 7 is BUILT, not COMPLETE.** Three criteria are unmet (2, 4,
+8) and three are partial (1, 3, 7). Only 5 — the gate proven to fail — and 6 are
+unreservedly done.
+
+The gap that matters least is 8, because it is only a deployment. The gap that
+matters most is 1 and 3 together: **eight of the twelve golden cases have never
+run against a live stack.** Everything quoted about this detector's accuracy
+comes from four cases, and the four were chosen to be fast. A case that has
+never executed is a case whose expected edge, budget and traps are all
+untested assertions — which is the same class of defect as F23 and F30, both of
+which were only found by running the thing.
 
 **Two items are unfinished and neither is claimed.**
 
