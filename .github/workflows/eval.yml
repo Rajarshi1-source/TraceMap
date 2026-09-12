@@ -55,7 +55,25 @@ permissions:
 jobs:
   eval:
     name: golden set (${{ github.event_name == 'pull_request' && 'smoke' || 'full' }})
-    runs-on: ubuntu-latest
+    # F48. The runner is configuration, not a constant, because it is the
+    # variable under test.
+    #
+    # This is a PRIVATE repository, so `ubuntu-latest` is 2 vCPU / 7 GB. Run 14
+    # logged 32 confirmation windows that reset before completing -- 19 of them
+    # above 500ms, the largest at +2170.4ms -- against 5 alerts actually firing
+    # across 11 scored cases. A 2.17-second delta failing to confirm is not a
+    # threshold set too high; a bar set too high produces no breach at all.
+    # Those are breaches resetting because the per-minute percentile is swinging
+    # across the bar on a contended host.
+    #
+    # Set the `EVAL_RUNNER` repository variable to a larger-runner label to test
+    # that. It is a variable and not a hardcoded label on purpose: GitHub's
+    # larger runners require Team or Enterprise, this is a personal account, and
+    # a label that resolves to nothing does not fail -- the job queues forever,
+    # which is the one failure mode a nightly must not have. Defaulting to
+    # `ubuntu-latest` means a wrong or absent value degrades to the status quo
+    # rather than to silence.
+    runs-on: ${{ vars.EVAL_RUNNER || 'ubuntu-latest' }}
     # 110 minutes for the full set is not padding. Ten fault cases running to
     # detection plus a 90s trap grace, two null cases holding 600s each, eleven
     # 60s settling gaps and a 5-minute warm-up. A timeout tighter than the
@@ -96,6 +114,24 @@ jobs:
         # real fault, watch for an alert that can never arrive, and score a
         # working detector as a false negative.
         run: python -m pytest eval/tests -q -c eval/pytest.ini --rootdir=.
+
+      - name: record the hardware this score was measured on
+        # F48. Every other number in this run carries its provenance --
+        # `topology_at_start` says what the graph looked like, `traps_valid`
+        # says whether the decoys held. The HOST did not, and the host turned
+        # out to be the variable that explains most of run 14.
+        #
+        # A score is not comparable to another score unless you can tell what
+        # they were measured on, so this rides along in the artifact next to
+        # eval-run.json.
+        run: |
+          {
+            echo "runner_label=${{ vars.EVAL_RUNNER || 'ubuntu-latest' }}"
+            echo "vcpu=$(nproc)"
+            echo "mem_total_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+            echo "model=$(awk -F: '/model name/ {print $2; exit}' /proc/cpuinfo | xargs)"
+          } | tee runner-specs.txt
+          echo "::notice::$(nproc) vCPU, $(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 )) GB"
 
       - name: boot the stack
         run: |
@@ -176,6 +212,7 @@ jobs:
           path: |
             eval-run.json
             eval-report.md
+            runner-specs.txt
           retention-days: 30
 
       - name: logs on failure
