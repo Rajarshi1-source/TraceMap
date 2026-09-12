@@ -1936,6 +1936,60 @@ box"*.
 **What would close it completely** is still one full-set run on a 4-vCPU runner,
 which `vars.EVAL_RUNNER` now exists to enable without a code change.
 
+### The A/B that settles it: the same commit, two nights, four different cases
+
+The nightly schedule ran the full set twice on **exactly the same commit**
+(`6b39334`), on the same class of runner, forty-eight hours apart. Nothing in
+the repository changed between them.
+
+| case | 10 Sep | 12 Sep | |
+|---|---|---|---|
+| `null_baseline` | true_positive | true_positive | |
+| `null_traffic_ramp` | false_positive | true_positive | **flapped** |
+| `payment_latency_60ms` | false_negative | false_negative | |
+| `payment_latency_200ms` | true_positive | wrong_edge | **flapped** |
+| `product_latency_800ms` | true_positive | true_positive | |
+| `parallel_decoy` | false_positive | false_positive | |
+| `payment_errors_10pct` | true_positive | true_positive | |
+| `payment_errors_50pct` | true_positive | true_positive | |
+| `user_cpu_saturation` | wrong_edge | invalid_precondition | **flapped** |
+| `payment_db_down` | wrong_edge | wrong_edge | |
+| `deploy_correlated` | false_negative | false_negative | |
+| `gateway_latency_cascade` | true_positive | false_negative | **flapped** |
+
+```
+10 Sep   precision 0.600   recall 0.750   f1 0.667   mttd p95 393.6s
+12 Sep   precision 0.625   recall 0.625   f1 0.625   mttd p95 213.2s
+```
+
+**Four of twelve cases produced a different outcome on identical code**, and
+MTTD p95 differed by 85% — 393.6 s on one night, within a tenth of the 432 s
+ceiling, and 213.2 s on the other.
+
+That is not a detector changing. It is the same detector measured twice, and it
+is the cleanest statement of F48 available: **on this hardware the scoreboard is
+not a deterministic function of the code.** A third of the set is decided by
+whatever else the runner was doing.
+
+It also caught **F44 working**. `user_cpu_saturation` scored `wrong_edge` on the
+10th and `invalid_precondition` on the 12th — the precondition check fired on
+exactly one of the two nights, because `order-svc→payment-svc` had drifted past
+the case's 40 ms margin by then and not before. The premise really is
+host-dependent, and the guard really does catch it only when it fails.
+
+**What this means for every score in the table above.** A single run of this set
+on a 2-vCPU runner has a confidence interval wide enough to swallow the
+difference between any two of the detector variants tested. Comparing run 3 to
+run 4 to run 14 as though each were a clean measurement of a code change
+overstates what those numbers can carry — the F43b conclusion (recall halved)
+survives because it was an eightfold effect confirmed by a mechanism in the
+logs, but a 0.04 movement in F1 between runs means nothing at all.
+
+**The correct response is not to widen the gate.** It is to stop drawing
+conclusions from single runs on this hardware — and that is an argument for
+running the set somewhere quieter, which is what `vars.EVAL_RUNNER` now exists
+to allow.
+
 ### F49 — 🔴 The reconciler guard compared a bucket that was still being written — FIXED
 
 `make critical-path-guard` reported a **3.56% divergence** between the assembler

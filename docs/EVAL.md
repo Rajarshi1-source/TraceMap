@@ -1,8 +1,9 @@
 # Evaluating the detector
 
 The detector is a model, so it is evaluated like one: a held-out set of labelled
-cases, a scoreboard, a committed baseline, and a merge gate that has been proven
-to go red.
+cases, a scoreboard, a baseline committed only from a green run, and a merge gate
+that has been proven to go red. There is no committed baseline yet, and §9 is
+why.
 
 This document is the methodology. **The scores are not in it.** They live in
 `eval-report.md` and `eval/baselines/main-<tier>.json`, written by a run, and
@@ -259,7 +260,7 @@ dedicated CI hardware and not locally.
 
 ---
 
-## 9. Five full-set runs, all red — and what each one bought
+## 9. Six full-set runs, all red — and what each one bought
 
 Recorded here rather than quietly re-run until they passed, because a harness
 whose failures are not published is a harness nobody should believe. Two of these
@@ -267,17 +268,22 @@ runs measured the harness rather than the detector, one measured a defect the fi
 itself introduced, and the last one found that the *runner* cannot sustain the
 detector's confirmation window at all. That sequence is the useful part.
 
-| | Run 1 | Run 2 | Run 3 | Run 4 | Run 14 | gate |
-|---|---|---|---|---|---|---|
-| run | [3384…4520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [3386…7967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [3387…7809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | [3388…7039](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33887207039) | [3468…0528](https://github.com/Rajarshi1-source/TraceMap/actions/runs/34680830528) | |
-| detector | flat 50 ms | flat 50 ms | flat 50 ms | 4× MAD, ungated | **4× MAD, gated** | |
-| **traps valid?** | unknown | **no** (F42) | yes | yes | yes | |
-| **premises valid?** | unchecked | unchecked | unchecked | unchecked | **1 excluded** (F44) | |
-| precision | 0.583 | 0.500 | 0.500 | 0.714 | **0.625** | ≥ 0.870 ✗ |
-| recall | 1.000 | 1.000 | 1.000 | 0.500 | **0.625** | — |
-| f1 | 0.737 | 0.667 | 0.667 | 0.588 | **0.625** | ≥ 0.820 ✗ |
-| mttd p95 | 213 s | 214 s | 282 s | 214 s | **213 s** | ≤ 432 s ✓ |
-| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | 5 tp / 2 fp / 5 fn | 5 tp / 3 fp / 3 fn | **FAIL** |
+| | Run 1 | Run 2 | Run 3 | Run 4 | 10 Sep | 12 Sep | gate |
+|---|---|---|---|---|---|---|---|
+| run | [3384…4520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [3386…7967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [3387…7809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | [3388…7039](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33887207039) | [3445…1879](https://github.com/Rajarshi1-source/TraceMap/actions/runs/34451121879) | [3468…0528](https://github.com/Rajarshi1-source/TraceMap/actions/runs/34680830528) | |
+| commit | — | — | — | — | `6b39334` | `6b39334` | |
+| detector | flat 50 ms | flat 50 ms | flat 50 ms | 4× MAD, ungated | 4× MAD, gated | 4× MAD, gated | |
+| **traps valid?** | unknown | **no** (F42) | yes | yes | yes | yes | |
+| **premises valid?** | unchecked | unchecked | unchecked | unchecked | *not caught* | **1 excluded** (F44) | |
+| precision | 0.583 | 0.500 | 0.500 | 0.714 | **0.600** | **0.625** | ≥ 0.870 ✗ |
+| recall | 1.000 | 1.000 | 1.000 | 0.500 | **0.750** | **0.625** | — |
+| f1 | 0.737 | 0.667 | 0.667 | 0.588 | **0.667** | **0.625** | ≥ 0.820 ✗ |
+| mttd p95 | 213 s | 214 s | 282 s | 214 s | **394 s** | **213 s** | ≤ 432 s ✓ |
+| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | 5 tp / 2 fp / 5 fn | 6 tp / 4 fp / 2 fn | 5 tp / 3 fp / 3 fn | **FAIL** |
+
+**The last two columns are the same commit.** Read them side by side before
+reading anything into the others: four of twelve cases disagree, and MTTD p95
+differs by 85%.
 
 **MTTD p95 clears its ceiling in every run.** This is the number a developer
 machine cannot produce: detection latency is measured against `time.monotonic()`,
@@ -531,6 +537,60 @@ box"*.
 
 **What would close it completely** is still one full-set run on a 4-vCPU runner,
 which `vars.EVAL_RUNNER` now exists to enable without a code change.
+
+### The A/B that settles it: the same commit, two nights, four different cases
+
+The nightly schedule ran the full set twice on **exactly the same commit**
+(`6b39334`), on the same class of runner, forty-eight hours apart. Nothing in
+the repository changed between them.
+
+| case | 10 Sep | 12 Sep | |
+|---|---|---|---|
+| `null_baseline` | true_positive | true_positive | |
+| `null_traffic_ramp` | false_positive | true_positive | **flapped** |
+| `payment_latency_60ms` | false_negative | false_negative | |
+| `payment_latency_200ms` | true_positive | wrong_edge | **flapped** |
+| `product_latency_800ms` | true_positive | true_positive | |
+| `parallel_decoy` | false_positive | false_positive | |
+| `payment_errors_10pct` | true_positive | true_positive | |
+| `payment_errors_50pct` | true_positive | true_positive | |
+| `user_cpu_saturation` | wrong_edge | invalid_precondition | **flapped** |
+| `payment_db_down` | wrong_edge | wrong_edge | |
+| `deploy_correlated` | false_negative | false_negative | |
+| `gateway_latency_cascade` | true_positive | false_negative | **flapped** |
+
+```
+10 Sep   precision 0.600   recall 0.750   f1 0.667   mttd p95 393.6s
+12 Sep   precision 0.625   recall 0.625   f1 0.625   mttd p95 213.2s
+```
+
+**Four of twelve cases produced a different outcome on identical code**, and
+MTTD p95 differed by 85% — 393.6 s on one night, within a tenth of the 432 s
+ceiling, and 213.2 s on the other.
+
+That is not a detector changing. It is the same detector measured twice, and it
+is the cleanest statement of F48 available: **on this hardware the scoreboard is
+not a deterministic function of the code.** A third of the set is decided by
+whatever else the runner was doing.
+
+It also caught **F44 working**. `user_cpu_saturation` scored `wrong_edge` on the
+10th and `invalid_precondition` on the 12th — the precondition check fired on
+exactly one of the two nights, because `order-svc→payment-svc` had drifted past
+the case's 40 ms margin by then and not before. The premise really is
+host-dependent, and the guard really does catch it only when it fails.
+
+**What this means for every score in the table above.** A single run of this set
+on a 2-vCPU runner has a confidence interval wide enough to swallow the
+difference between any two of the detector variants tested. Comparing run 3 to
+run 4 to run 14 as though each were a clean measurement of a code change
+overstates what those numbers can carry — the F43b conclusion (recall halved)
+survives because it was an eightfold effect confirmed by a mechanism in the
+logs, but a 0.04 movement in F1 between runs means nothing at all.
+
+**The correct response is not to widen the gate.** It is to stop drawing
+conclusions from single runs on this hardware — and that is an argument for
+running the set somewhere quieter, which is what `vars.EVAL_RUNNER` now exists
+to allow.
 
 ### What is not being done about it
 

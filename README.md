@@ -32,7 +32,7 @@ by design.
 >
 > Three things are honestly open, and each links to where it is written up.
 >
-> The **eval gate is red** after five full twelve-case runs on CI, and the most
+> The **eval gate is red** after six full twelve-case runs on CI, and the most
 > useful thing the sequence produced is *why*. Two runs measured the **harness**
 > rather than the detector (**F42**, **F44**) — impossible to repeat now, since
 > every run artifact records whether its own traps and premises held on the host.
@@ -45,7 +45,10 @@ by design.
 > Measured on a quiet host: the same edge, same code, same load, learns a noise
 > floor of **5.06 ms** here against **at least 58.5 ms** on the runner. MTTD p95
 > clears its ceiling in every run.
-> [`docs/EVAL.md §9`](docs/EVAL.md) has all five runs and what each one bought.
+> Two nightly runs of the **same commit** disagreed on **four of twelve cases**
+> and on MTTD p95 by 85%, so a single run on that hardware cannot carry a
+> conclusion about a code change.
+> [`docs/EVAL.md §9`](docs/EVAL.md) has all six runs and what each one bought.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
@@ -274,8 +277,10 @@ that visibly re-ranks the map.
 
 **A detector treated as a model** ([`docs/EVAL.md`](docs/EVAL.md)) — twelve
 labelled cases including two null cases and a decoy that a wall-clock detector
-fails by design; precision, recall, F1 and MTTD; a committed baseline; and a CI
-gate that has been *proven* to go red.
+fails by design; precision, recall, F1 and MTTD; and a CI gate that has been
+*proven* to go red. The baseline is recorded **only from a green run**, so there
+is not one yet and `check_regression` exits 2 rather than passing — the cheapest
+way to turn a red gate green is to stop measuring.
 
 **Error budgets on critical-path latency** ([ADR 0008](docs/adr/0008-slos-on-critical-path-latency.md))
 — an edge can burn 700 ms of wall clock and zero error budget, because those
