@@ -259,23 +259,25 @@ dedicated CI hardware and not locally.
 
 ---
 
-## 9. Four full-set runs, all red — and what each one bought
+## 9. Five full-set runs, all red — and what each one bought
 
 Recorded here rather than quietly re-run until they passed, because a harness
 whose failures are not published is a harness nobody should believe. Two of these
-runs measured the harness rather than the detector, and one measured a defect the
-fix itself introduced. That sequence is the useful part.
+runs measured the harness rather than the detector, one measured a defect the fix
+itself introduced, and the last one found that the *runner* cannot sustain the
+detector's confirmation window at all. That sequence is the useful part.
 
-| | Run 1 | Run 2 | Run 3 | Run 4 | gate |
-|---|---|---|---|---|---|
-| run | [3384…4520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [3386…7967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [3387…7809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | [3388…7039](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33887207039) | |
-| detector | flat 50 ms | flat 50 ms | flat 50 ms | 4× MAD | |
-| **traps valid?** | unknown | **no** (F42) | yes | yes | |
-| precision | 0.583 | 0.500 | 0.500 | **0.714** | ≥ 0.870 ✗ |
-| recall | 1.000 | 1.000 | 1.000 | **0.500** | — |
-| f1 | 0.737 | 0.667 | 0.667 | **0.588** | ≥ 0.820 ✗ |
-| mttd p95 | 213 s | 214 s | 282 s | 214 s | ≤ 432 s ✓ |
-| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | 5 tp / 2 fp / **5 fn** | **FAIL** |
+| | Run 1 | Run 2 | Run 3 | Run 4 | Run 14 | gate |
+|---|---|---|---|---|---|---|
+| run | [3384…4520](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33848444520) | [3386…7967](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33860377967) | [3387…7809](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33870357809) | [3388…7039](https://github.com/Rajarshi1-source/TraceMap/actions/runs/33887207039) | [3468…0528](https://github.com/Rajarshi1-source/TraceMap/actions/runs/34680830528) | |
+| detector | flat 50 ms | flat 50 ms | flat 50 ms | 4× MAD, ungated | **4× MAD, gated** | |
+| **traps valid?** | unknown | **no** (F42) | yes | yes | yes | |
+| **premises valid?** | unchecked | unchecked | unchecked | unchecked | **1 excluded** (F44) | |
+| precision | 0.583 | 0.500 | 0.500 | 0.714 | **0.625** | ≥ 0.870 ✗ |
+| recall | 1.000 | 1.000 | 1.000 | 0.500 | **0.625** | — |
+| f1 | 0.737 | 0.667 | 0.667 | 0.588 | **0.625** | ≥ 0.820 ✗ |
+| mttd p95 | 213 s | 214 s | 282 s | 214 s | **213 s** | ≤ 432 s ✓ |
+| | 7 tp / 5 fp | 6 tp / 6 fp | 6 tp / 6 fp | 5 tp / 2 fp / 5 fn | 5 tp / 3 fp / 3 fn | **FAIL** |
 
 **MTTD p95 clears its ceiling in every run.** This is the number a developer
 machine cannot produce: detection latency is measured against `time.monotonic()`,
@@ -413,18 +415,62 @@ verdict rather than in a details block; and past `MAX_EXCLUSIONS = 2` the run
 fails outright, while `check_regression --update` refuses to record a baseline
 from a run with *any* exclusions.
 
-### The open question, still open
+### Run 14 answered the open question — and asked a better one
 
-With correct gating, does the null-case gain survive — or did it come *from* the
-runaway? The bar that suppressed `gateway-svc→order-svc` may have been one that
-had already walked upward. Only a run answers that, and the next run now answers
-it against a set that can no longer charge the detector for its own broken
-premises.
+The nightly schedule settled it without a dispatch. Run 14 carries F43's
+dispersion bar with **correct gating** plus F44's precondition checks, and it is
+the first run whose traps *and* premises were both validated against the host.
 
-**What the arithmetic does not promise.** F43 plus parent suppression reaches
-precision 0.833 against a 0.870 floor. At least one more real defect — the decoy
-case, or the cascade — stands between here and green. F44 does not close that
-gap; it stops the harness from widening it.
+**Both null cases passed.** The F43 gain was real, not an artefact of the
+runaway — including `null_traffic_ramp`, which is F38. That question is closed.
+
+`user_cpu_saturation` was excluded, exactly as F44 predicted, and the run's own
+snapshot shows why: it budgets a 250 ms burn to overtake an edge recorded at
+157.0 ms and **measured at 307.8 ms that night**.
+
+But the remaining failures are not what four runs of threshold work assumed.
+
+### F48 — the confirmation window cannot complete on a contended runner
+
+The detector confirms a breach with **3 cycles out of the last 5**, one a minute.
+That assumes bucket-to-bucket critical p99 is stable enough for three of five
+consecutive minutes to stay over the bar. Run 14's own logs say it is not:
+
+| | |
+|---|---|
+| cycles where a breach was seen and the window **reset before completing** | **32** |
+| of those, at a delta above 500 ms | **19** |
+| largest delta whose window never completed | **+2170.4 ms** |
+| alerts that actually fired, across 11 scored cases | 5 |
+
+**A 2.17-second delta failing to confirm is not a threshold set too high.** A bar
+set too high produces *no breach at all*. These are breaches that keep resetting,
+because the per-minute percentile is swinging across the bar on a contended
+2-vCPU host.
+
+That accounts for the shape of everything left. Three false negatives are faults
+that were plainly visible and never confirmed. Both `wrong_edge` results are the
+*parent* edge confirming while its child did not — not because the parent is
+preferred, but because it happened to string three cycles together and the child
+did not. Which means **parent suppression would not have helped**: it would have
+removed the parent's alert and left nothing, converting two `wrong_edge` into two
+false negatives. That is the same trap run 4 fell into, and the arithmetic caught
+it this time before the change was made rather than after.
+
+**It is not being fixed by widening the window.** Loosening `sustained_cycles`
+until CI goes green is tuning a threshold to clear a gate — M8 — and it would
+make the detector twitchier everywhere to accommodate one host. The confirmation
+policy exists because one bad minute must never page anyone, and that does not
+stop being true because the runner is busy.
+
+**It names its own test.** The same detector confirmed cleanly on a quiet host in
+Phase 6. The cheapest experiment is one nightly run on a 4-vCPU runner: if the
+numbers move, the gate's redness was substantially the runner; if they do not,
+this entry is wrong and the detector owns it.
+
+This was predicted before the very first dispatch — *"it may also fail, and if it
+does, that is a genuine finding about where this suite can run, not a wasted
+afternoon."* Five runs later it is measured rather than predicted.
 
 ### What is not being done about it
 

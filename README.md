@@ -32,25 +32,24 @@ by design.
 >
 > Three things are honestly open, and each links to where it is written up.
 >
-> The **eval gate is red** after four full twelve-case runs on CI. MTTD p95
-> clears its ceiling every time. Two of the four measured the *harness* rather
-> than the detector (**F42**), which is now impossible to repeat: every run
-> artifact records whether its own traps were valid. The fourth tested a fix for
-> **F43** and produced the most useful failure of the set — both null cases
-> passed for the first time, and recall halved, because the fix's second pass
-> reintroduced M6's boiling frog one derivative up (**F43b**). Reverted, with the
-> test that catches it. There was no fifth run: the arithmetic says the gate
-> needs 11 of 12 cases, and **two of the twelve turned out not to be measuring
-> the detector at all** (**F44**) — their premise is an ordering computed against
-> a constant the CI host contradicts. Cases now assert their own preconditions
-> and are excluded, loudly, when those do not hold.
-> [`docs/EVAL.md §9`](docs/EVAL.md) has all four runs and what each one bought.
+> The **eval gate is red** after five full twelve-case runs on CI, and the most
+> useful thing the sequence produced is *why*. Two runs measured the **harness**
+> rather than the detector (**F42**, **F44**) — impossible to repeat now, since
+> every run artifact records whether its own traps and premises held on the host.
+> One tested a fix for **F43** and halved recall, because the fix's second pass
+> reintroduced M6's boiling frog one derivative up (**F43b**). The latest shows
+> the remaining failures are largely not the detector at all: **32 confirmation
+> windows reset before completing, 19 of them above 500 ms, the largest at
+> +2170 ms** (**F48**). A 2.17-second delta failing to confirm is not a threshold
+> set too high — it is a 2-vCPU runner too contended to hold a 3-of-5 window.
+> MTTD p95 clears its ceiling in every run.
+> [`docs/EVAL.md §9`](docs/EVAL.md) has all five runs and what each one bought.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
 >
-> Forty-four defects are logged in
-> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), six of them found in
+> Forty-eight defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), ten of them found in
 > Phase 8 by running the system rather than reading it.
 
 ---
