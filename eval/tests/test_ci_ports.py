@@ -140,3 +140,71 @@ def test_the_makefile_agrees_too(published):
         assert f"{var}:-{port}" in makefile, (
             f"Makefile EVAL_ENV does not fall back to {port} for {var}"
         )
+
+
+# ---------------------------------------------------------------------------
+# F47 -- the workflow must not name a baseline file that cannot exist.
+# ---------------------------------------------------------------------------
+
+def test_workflow_does_not_hardcode_a_baseline_path(workflow_text: str):
+    """`--baseline eval/baselines/main.json` was in this workflow for weeks.
+
+    That file has never existed. Baselines are tier-named -- `main-full.json`,
+    `main-smoke.json` -- because smoke and full scores are computed over
+    different case mixes, and check_regression derives the name from the run's
+    own tier. Naming one here could only ever override that with the wrong one.
+
+    It stayed invisible because the runner exits non-zero on a red gate, so the
+    step never ran. It would have surfaced on the first GREEN run, as an
+    exit 2 reading "no baseline" -- on the one run anybody would have wanted to
+    record a baseline from.
+    """
+    # Comment lines are stripped first: the fix itself explains the flag by
+    # name, and a guard that cannot tell an invocation from the note explaining
+    # why the invocation was removed is not a guard.
+    live = "\n".join(ln for ln in workflow_text.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "--baseline" not in live, (
+        "the eval workflow passes --baseline; let check_regression derive "
+        "main-<tier>.json from the run's own tier instead"
+    )
+
+
+def test_baseline_filenames_are_tier_scoped():
+    """The naming the above depends on, asserted where it is documented."""
+    readme = (ROOT / "eval" / "baselines" / "README.md").read_text(encoding="utf-8")
+    assert "main-smoke.json" in readme
+    assert "main-full.json" in readme
+
+
+def test_the_drift_report_survives_a_missing_baseline(workflow_text: str):
+    """F46. This job's only purpose is to report, and it crashed every night.
+
+    It read the committed baseline unconditionally, and no baseline exists --
+    which is the DESIGNED state, since one is recorded only from a green run.
+    So the single condition it was guaranteed to meet was the one it could not
+    survive, and its failure looked exactly like the eval having failed.
+
+    A reporting job must not have a failure mode that hides its own report.
+    """
+    i = workflow_text.find("drift-report:")
+    assert i > 0, "drift-report job not found"
+    job = workflow_text[i:]
+    assert "base_path.exists()" in job, (
+        "the drift report reads the baseline unconditionally again")
+    assert "No committed baseline" in job, (
+        "the drift report no longer explains an absent baseline")
+
+
+def test_the_drift_report_separates_exclusions_from_failures(workflow_text: str):
+    """An excluded case is the harness's problem, not the detector's.
+
+    Listing the two together under one heading mislabels a case whose premise
+    was false as a case the detector got wrong -- which is the exact confusion
+    F44 exists to remove.
+    """
+    i = workflow_text.find("drift-report:")
+    job = workflow_text[i:]
+    assert "invalid_precondition" in job
+    assert "cases the detector got wrong" in job
+    assert "premise false on this host" in job

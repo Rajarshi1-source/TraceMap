@@ -41,16 +41,21 @@ CREATE TABLE IF NOT EXISTS eval_cases (
     expected_edge  TEXT NOT NULL,
     detected_edge  TEXT,
     detected_at_s  NUMERIC,
-    -- Four outcomes, and the constraint is deliberate: a fifth one invented at
-    -- 2am to make a run look better would have to be argued for in a migration
-    -- rather than slipped into a dict.
+    -- The outcomes, and the constraint is deliberate: a new one invented at
+    -- 2am to make a run look better has to be argued for in a migration rather
+    -- than slipped into a dict.
+    --
+    -- That is not hypothetical. F44 added `invalid_precondition` in Python and
+    -- not here, and this constraint is what caught it -- in CI, at the end of a
+    -- 105-minute run (F45). The guard did its job; the argument is below.
     --
     -- `wrong_edge` is separate from `false_positive` only so the failure stays
     -- legible afterwards. Both count against precision, because an alert
     -- pointing at the wrong service costs the same on-call hour as one
     -- pointing at an innocent one.
     outcome        TEXT NOT NULL CHECK (outcome IN
-                   ('true_positive','false_negative','false_positive','wrong_edge')),
+                   ('true_positive','false_negative','false_positive','wrong_edge',
+                    'invalid_precondition')),
     detail         TEXT
 );
 
@@ -60,3 +65,31 @@ CREATE INDEX IF NOT EXISTS idx_eval_cases_run
 -- question you actually ask, and it is a scan without this.
 CREATE INDEX IF NOT EXISTS idx_eval_cases_name
     ON eval_cases (case_name, id);
+
+-- ---------------------------------------------------------------------------
+-- F45 -- the migration the CHECK constraint above demanded.
+--
+-- `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+-- widening the inline constraint fixes a FRESH database and leaves every
+-- existing one rejecting the new value. That is the worse half of the bug,
+-- because it only surfaces on the deployments that have history worth keeping.
+--
+-- This file is executed in full by the runner on every start, so it has to be
+-- idempotent: DROP IF EXISTS then ADD converges both paths on the same
+-- constraint and can be run any number of times.
+--
+-- THE ARGUMENT for a fifth outcome, since the comment above rightly insists on
+-- one. `invalid_precondition` is not a fifth way for the detector to be wrong.
+-- It records a case that was NOT RUN, because the ordering it asserts was
+-- measurably false before any fault was injected -- case 009 budgets a 250ms
+-- burn to overtake an edge recorded at 157ms and measured at 307.8ms on the
+-- host that night. Scoring that as a false negative charges the detector for
+-- the harness's own broken premise. The row exists so the exclusion is
+-- auditable afterwards rather than silently absent, and `eval/scorer.py`
+-- removes it from every ratio. `MAX_EXCLUSIONS` is what stops it becoming a
+-- way to make a gate green.
+-- ---------------------------------------------------------------------------
+ALTER TABLE eval_cases DROP CONSTRAINT IF EXISTS eval_cases_outcome_check;
+ALTER TABLE eval_cases ADD CONSTRAINT eval_cases_outcome_check
+    CHECK (outcome IN ('true_positive', 'false_negative', 'false_positive',
+                       'wrong_edge', 'invalid_precondition'));

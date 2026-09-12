@@ -701,8 +701,8 @@ nobody should trust.
 ## 2h. Found while building (Phases 7–8)
 
 Twenty-one findings. **Eleven in the harness, three in the detector, two in the
-environment it needs, six found in Phase 8 by running the system rather than
-reading it, and one still open (F38)** — which is the phase working as intended.
+environment it needs, ten found in Phase 8 by running the system rather than
+reading it, and two still open (F38, F48)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
 detector as broken.
@@ -1753,6 +1753,128 @@ says F43 plus parent suppression reaches precision 0.833 against a 0.870 floor,
 so at least one more real defect stands between here and green. What it does is
 stop the harness from charging the detector for cases the harness cannot run —
 which is the difference between a score that is low and a score that is wrong.
+
+### F45 — 🔴 A fifth outcome in Python and not in the schema — FIXED
+
+The `eval_cases.outcome` column carries a CHECK constraint, and the comment
+above it reads:
+
+> *Four outcomes, and the constraint is deliberate: a fifth one invented at 2am
+> to make a run look better would have to be argued for in a migration rather
+> than slipped into a dict.*
+
+F44 added `invalid_precondition` in Python and nowhere else. The constraint
+caught it — in CI, at the end of a **105-minute run**:
+
+```
+psycopg.errors.CheckViolation: new row for relation "eval_cases"
+violates check constraint "eval_cases_outcome_check"
+DETAIL: Failing row contains (..., user_cpu_saturation, ..., invalid_precondition, ...)
+```
+
+The guard did exactly its job. The scoreboard was lost from Postgres, so
+`/api/eval` and every `tracemap_eval_*` gauge had no row for that run — which is
+what `EvalNotRunning` exists to catch, one level further out.
+
+**Fixed** with the migration the comment demanded, carrying its argument:
+`invalid_precondition` is not a fifth way for the detector to be wrong, it
+records a case that was *not run*. `CREATE TABLE IF NOT EXISTS` does nothing to
+an existing table, so widening the inline constraint alone would fix a fresh
+database and leave every deployed one rejecting the value — the worse half,
+because it only bites where there is history worth keeping. The file is executed
+in full on every runner start, so the migration is `DROP IF EXISTS` then `ADD`.
+
+**Guarded** by `test_the_sql_check_constraint_matches_the_python_outcomes`,
+which parses the constraint and compares it to `eval.scorer.OUTCOMES`. That test
+runs in `pytest eval/tests`, which the workflow executes **before booting
+anything** — so this class of defect now fails in milliseconds instead of at
+minute 105. Checked red against the four-outcome schema first.
+
+---
+
+### F46 — 🔴 The nightly drift report crashed every night, in six seconds — FIXED
+
+`drift-report` read `eval/baselines/main-<tier>.json` unconditionally. No
+baseline exists, and its absence is the **designed** state: `check_regression`
+exits 2 without one, deliberately, because the cheapest way to turn a red gate
+green is to stop measuring.
+
+So the one condition this job was guaranteed to meet on a project that has never
+had a green run was the one it could not survive. It had been failing since the
+schedule started, and on the runs page its failure looked exactly like the eval
+itself having failed.
+
+**A reporting job must not have a failure mode that hides its own report.** It
+now prints tonight's absolute numbers either way and explains why there is
+nothing to compare against.
+
+It also separates *cases the detector got wrong* from *cases not run — premise
+false on this host*. Listing those under one heading mislabels the harness's
+problem as the detector's, which is the exact confusion F44 exists to remove.
+
+---
+
+### F47 — 🔴 The regression gate named a baseline file that cannot exist — FIXED
+
+`--baseline eval/baselines/main.json`. Baselines are tier-named —
+`main-full.json`, `main-smoke.json` — because smoke and full scores are computed
+over different case mixes and comparing them is a category error rather than a
+lenient check. `check_regression` derives that name from the run's own tier, so
+naming a file here could only ever override it with the wrong one.
+
+It stayed invisible because the runner exits non-zero on a red gate and the step
+never ran. **It would have surfaced on the first green run** — as an exit 2
+reading "no baseline", on the one run anybody would have wanted to record a
+baseline from.
+
+Guarded, with comment lines stripped first: the fix explains the flag by name,
+and a guard that cannot tell an invocation from the note explaining its removal
+is not a guard.
+
+---
+
+### F48 — 🟡 The confirmation window cannot complete on a contended runner — OPEN
+
+The finding that reframes the four red runs, and it is not about the detector.
+
+The detector confirms a breach with **3 cycles out of the last 5**, one cycle a
+minute. That policy assumes bucket-to-bucket critical p99 is stable enough for
+three of five consecutive minutes to stay over the bar. Run 14's own logs say it
+is not, on a 2-vCPU GitHub runner:
+
+| | |
+|---|---|
+| cycles where a breach was seen and the window **reset before completing** | **32** |
+| of those, at a delta above 500 ms | **19** |
+| largest delta whose window never completed | **+2170.4 ms** |
+| alerts that actually fired, across 11 scored cases | 5 |
+
+**A 2.17-second delta failing to confirm is not a threshold set too high.** A bar
+set too high produces *no breach at all*; these are breaches that keep resetting.
+The per-minute percentile is swinging across the bar repeatedly because the
+substrate producing it is contended.
+
+That also explains the shape of every failure left in run 14. Three false
+negatives are cases where the fault was plainly visible and never confirmed, and
+both `wrong_edge` results are the *parent* edge confirming while its child did
+not — not because the parent is preferred, but because it happened to string
+three cycles together and the child did not.
+
+**Why this is not an excuse.** It is falsifiable and it names its own test: the
+same detector on a quiet host confirmed cleanly in Phase 6, and the cheapest
+experiment is one nightly run on a 4-vCPU runner. If the numbers move, the gate's
+redness was substantially the runner; if they do not, this entry is wrong and the
+detector owns it.
+
+**Why it is not being "fixed" by widening the window.** Loosening
+`sustained_cycles` until CI goes green is tuning a threshold to clear a gate,
+which is M8, and it would make the detector twitchier everywhere to accommodate
+one host. The confirmation policy exists because one bad minute must never page
+anyone. That reasoning does not stop being true because the runner is busy.
+
+This was predicted before the first dispatch — *"it may also fail, and if it
+does, that is a genuine finding about where this suite can run, not a wasted
+afternoon."* Four runs later it is measured rather than predicted.
 
 ---
 

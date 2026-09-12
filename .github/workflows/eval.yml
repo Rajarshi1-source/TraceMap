@@ -139,10 +139,20 @@ jobs:
         # detector good enough in absolute terms"; this asks "is it worse than
         # main". A detector that was always mediocre passes the first and fails
         # nothing; one that dropped from excellent to merely good fails this.
-        run: |
-          python -m eval.check_regression \
-            --baseline eval/baselines/main.json \
-            --current eval-run.json
+        #
+        # F47: no --baseline. This said `eval/baselines/main.json`, a path that
+        # has never existed -- the files are tier-named (`main-full.json`,
+        # `main-smoke.json`) because smoke and full scores are computed over
+        # different case mixes and comparing them is a category error rather
+        # than a lenient check. check_regression derives that name from the
+        # run's own tier, so naming a file here could only ever override it
+        # with the wrong one.
+        #
+        # It stayed invisible because the runner exits non-zero on a red gate
+        # and this step never ran. It would have surfaced on the first green
+        # run -- as an exit 2 reading "no baseline", on the one run anybody
+        # would have wanted to record a baseline from.
+        run: python -m eval.check_regression --current eval-run.json
 
       - name: assert no fault leaked
         # M29. A leaked fault does not announce itself -- it silently becomes
@@ -198,25 +208,69 @@ jobs:
         with:
           name: eval-full-${{ github.sha }}
       - name: summarise
+        # F46. This job's whole purpose is to REPORT, and it spent every night
+        # since the schedule started crashing in six seconds -- because it read
+        # the committed baseline unconditionally, and no baseline exists.
+        #
+        # That absence is the designed state: check_regression exits 2 without
+        # one, deliberately, because the cheapest way to turn a red gate green
+        # is to stop measuring. So the one condition this job was guaranteed to
+        # meet on a project that has never had a green run was the one it could
+        # not survive -- and its failure looked, on the runs page, exactly like
+        # the eval itself having failed.
+        #
+        # A reporting job must not have a failure mode that hides its own
+        # report. Now it reports tonight's numbers either way and says plainly
+        # why there is nothing to compare against.
         run: |
           python - <<'PY'
           import json, os, pathlib
           run = json.loads(pathlib.Path("eval-run.json").read_text())
-          base = json.loads(
-              pathlib.Path(f"eval/baselines/main-{run['tier']}.json").read_text())
-          s, b = run["scores"], base["scores"]
-          lines = ["## nightly detector drift", "",
-                   "| metric | tonight | baseline | delta |", "|---|---|---|---|"]
-          for k in ("f1", "precision", "recall", "mttd_p95_s"):
-              cur, old = s.get(k), b.get(k)
-              if cur is None or old is None:
-                  continue
-              lines.append(f"| {k} | {cur:.3f} | {old:.3f} | {cur - old:+.3f} |")
-          failed = [c for c in run["cases"] if c["outcome"] != "true_positive"]
+          s = run["scores"]
+          tier = run["tier"]
+
+          lines = [f"## nightly detector drift - `{tier}`", ""]
+
+          base_path = pathlib.Path(f"eval/baselines/main-{tier}.json")
+          if base_path.exists():
+              b = json.loads(base_path.read_text())["scores"]
+              lines += ["| metric | tonight | baseline | delta |", "|---|---|---|---|"]
+              for k in ("f1", "precision", "recall", "mttd_p95_s"):
+                  cur, old = s.get(k), b.get(k)
+                  if cur is None or old is None:
+                      continue
+                  lines.append(f"| {k} | {cur:.3f} | {old:.3f} | {cur - old:+.3f} |")
+          else:
+              lines += [
+                  "> **No committed baseline for this tier, so there is no drift",
+                  "> to report.** That is the designed state, not a fault: a",
+                  "> baseline is recorded only from a green run on `main`, and",
+                  "> `check_regression` exits 2 without one. Tonight's absolute",
+                  "> numbers are below.", "",
+                  "| metric | tonight |", "|---|---|"]
+              for k in ("f1", "precision", "recall", "mttd_p95_s"):
+                  if s.get(k) is not None:
+                      lines.append(f"| {k} | {s[k]:.3f} |")
+
+          excluded = [c for c in run["cases"]
+                      if c["outcome"] == "invalid_precondition"]
+          failed = [c for c in run["cases"]
+                    if c["outcome"] not in ("true_positive", "invalid_precondition")]
+
+          # Kept apart on purpose. An excluded case is not a case the detector
+          # got wrong -- it is one whose premise the measured topology
+          # contradicted before any fault was injected, and listing the two
+          # together under "not clean" mislabels the harness's problem as the
+          # detector's.
           if failed:
-              lines += ["", "### cases not clean", ""]
+              lines += ["", "### cases the detector got wrong", ""]
               lines += [f"- `{c['case_name']}` {c['outcome']} - {c['detail']}"
                         for c in failed]
+          if excluded:
+              lines += ["", "### cases not run - premise false on this host", ""]
+              lines += [f"- `{c['case_name']}` - {c['detail']}" for c in excluded]
+
           pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).write_text(
-              "\n".join(lines), encoding="utf-8")
+              "\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines))
           PY
