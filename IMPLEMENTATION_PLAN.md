@@ -701,8 +701,8 @@ nobody should trust.
 ## 2h. Found while building (Phases 7–8)
 
 Twenty-one findings. **Eleven in the harness, three in the detector, two in the
-environment it needs, ten found in Phase 8 by running the system rather than
-reading it, and two still open (F38, F48)** — which is the phase working as intended.
+environment it needs, twelve found in Phase 8 by running the system rather
+than reading it, and two still open (F38, F50)** — which is the phase working as intended.
 An eval suite that has never failed is evidence of an untested harness, not of a
 working detector, and four of these were found by the harness scoring a correct
 detector as broken.
@@ -1833,7 +1833,7 @@ is not a guard.
 
 ---
 
-### F48 — 🟡 The confirmation window cannot complete on a contended runner — OPEN
+### F48 — 🟢 The confirmation window cannot complete on a contended runner — MEASURED
 
 The finding that reframes the four red runs, and it is not about the detector.
 
@@ -1875,6 +1875,138 @@ anyone. That reasoning does not stop being true because the runner is busy.
 This was predicted before the first dispatch — *"it may also fail, and if it
 does, that is a genuine finding about where this suite can run, not a wasted
 afternoon."* Four runs later it is measured rather than predicted.
+
+**Measured, 12 Sep 2026.** F48 named its own test and the test has been run — not
+as a full control eval, but as a direct measurement of the quantity the claim is
+actually about. The substrate, not the scoreboard.
+
+Same stack, same commit, same 20 rps load profile, on a machine with 18 vCPU
+available to Docker instead of the runner's 2.
+
+| | this host (18 vCPU) | CI run 14 (2 vCPU) |
+|---|---|---|
+| `gateway-svc→order-svc` critical p99, mean | **176.4 ms** | 391.2 ms |
+| `order-svc→payment-svc` critical p99, mean | **148.3 ms** | 307.8 ms |
+| `gateway-svc→order-svc`, range over 38 one-minute buckets | **133.2 – 274.0 ms** | — |
+| largest excursion the detector logged | **+97.6 ms** | **+2170.4 ms** |
+
+And the detector's own learned dispersion, read straight out of Redis after
+warm-up on this host:
+
+```
+gateway-svc:order-svc:mad    5.06 ms     ->  bar = max(50, 20.2) = 50 ms  (the floor)
+order-svc:payment-svc:mad    0.18 ms     ->  bar = max(50,  0.7) = 50 ms  (the floor)
+```
+
+**On this host the F43 dispersion mechanism is completely inert.** Every edge
+sits on the brief's original 50 ms floor, so the detector here behaves exactly
+as the flat-threshold version did. That is the design working: dispersion only
+ever raises the bar, and there is no noise here to justify raising it.
+
+The CI figure can be bounded from the other direction. Run 14's null cases
+*passed*, so the 4 × MAD bar was high enough to suppress a measured +234 ms
+excursion on `gateway-svc→order-svc` — which requires **MAD > 58.5 ms** there.
+
+> **The same edge, the same code, the same load: a noise floor of 5.06 ms here
+> and at least 58.5 ms on the runner. A factor of eleven, minimum.**
+
+The whole observed range on this host — 141 ms wide — is narrower than a single
+CI excursion, and CI logged breach deltas up to twenty-two times the largest
+excursion seen here.
+
+**What this establishes, stated narrowly.** The measurement substrate differs by
+an order of magnitude between the two hosts, which is precisely what F48 claims
+and precisely what determines whether a 3-of-5 confirmation window can hold. It
+does **not** establish that a full twelve-case run would go green here — that run
+was not performed, and three attempts to run one in the background were killed by
+the environment before the first case started. The honest sentence is *"the
+substrate is eleven times quieter and the detector's own dispersion estimate says
+so"*, not *"the suite passes on a bigger box"*.
+
+**What would close it completely** is still one full-set run on a 4-vCPU runner,
+which `vars.EVAL_RUNNER` now exists to enable without a code change.
+
+### F49 — 🔴 The reconciler guard compared a bucket that was still being written — FIXED
+
+`make critical-path-guard` reported a **3.56% divergence** between the assembler
+and the independent reconciler, against a 2% tolerance. The same check had
+reported 0.00% earlier the same day, which is the shape of a flapping guard
+rather than a pipeline that broke and healed.
+
+Broken out per bucket, it is not a divergence at all:
+
+```
+18:13  assembled 3366  reconciled 3366    0.00%
+18:14  assembled 3414  reconciled 3414    0.00%
+18:15  assembled 3315  reconciled 3315    0.00%
+18:16  assembled 3408  reconciled 3408    0.00%
+18:17  assembled 3489  reconciled 3485    0.11%
+18:18  assembled 3380  reconciled 3384   -0.12%
+18:19  assembled 3520  reconciled 2881   22.18%   <- still being written
+```
+
+**Seven settled buckets agreeing to within 0.85%, and one in-flight bucket 22%
+low.** The reconciler works from `tracemap.spans` on a rolling five-minute
+lookback, so the newest minute is always partially populated on its side while
+the assembler has already finished with it. Summing across the boundary mixes a
+complete count with an incomplete one and calls the difference an error.
+
+**Fixed** by excluding the trailing two minutes from both sides. That is not a
+loosened tolerance — the tolerance is untouched at 2%. It is declining to compare
+a number that has not finished arriving, which is the same reasoning as the
+assembler's own `LATE_SPAN_GRACE_S`, applied to the thing that checks the
+assembler. After the fix: **0.05% over 40 buckets.**
+
+The failure mode is worth naming because it is the third instance this phase of
+the same underlying mistake — F42's decoy, F44's case premise, and now this:
+**a comparison whose window includes data that is not ready to be compared.**
+
+---
+
+### F50 — 🟡 The thesis guard's threshold sits inside the documented variance band — OPEN
+
+The same guard run also fails its headline assertion, and this one is *not*
+being fixed, because the evidence does not yet justify a change.
+
+```
+the thesis: parallel sibling blameless, slowest sibling blamed   FAIL
+    product-svc 88.7% zero-blame vs payment-svc 11.4%
+```
+
+The assertion is `product >= 90.0 and payment <= 10.0`. Measured across the
+session on two different stack instances:
+
+| | product-svc zero-blame | payment-svc zero-blame |
+|---|---|---|
+| earlier instance | 95.2% | 4.8% |
+| current, 18:10 window | 89.6% | 10.4% |
+| current, 18:15 window | 88.3% | 11.8% |
+
+**The threshold is 90% and the observations straddle it.** That is the same
+defect class as F44 — a constant whose margin is narrower than the variance of
+the thing it is measured against — and the variance here is *by design*:
+`product-svc` has an N+1 query path that fires on carts above a threshold, and
+`eval/cases/006` documents that roughly a fifth of generated carts cross it. On
+those traces product genuinely is the slowest leg and genuinely does carry
+blame, so its zero-blame share is a function of the cart-size mix, which is
+random.
+
+**Why it is being left open rather than adjusted.** I have two clean windows on
+one instance. That is enough to suspect the guard's *form* is wrong — the thesis
+is a claim about *separation* (88.7 vs 11.4 is a 77-point gap; 95.2 vs 4.8 is
+90 points, and both are overwhelming) and it is being asserted as two independent
+absolute levels. It is **not** enough to distinguish "the threshold is too tight"
+from "something actually regressed between the two instances", and changing a
+guard's threshold to make it pass on thin evidence is precisely the M8 failure
+this project keeps documenting in other people's code.
+
+**What would settle it** is the zero-blame share sampled across several hours and
+several stack restarts. If it sits in an 88–96% band, the assertion should be
+rewritten as a separation test with a margin wider than that band. If it has
+genuinely moved, the assembler owns it.
+
+The direction of the thesis holds overwhelmingly either way: the parallel sibling
+is blameless on ~9 rows in 10, the slowest sibling on ~1 in 10.
 
 ---
 

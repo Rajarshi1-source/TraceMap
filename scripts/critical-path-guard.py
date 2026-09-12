@@ -23,6 +23,11 @@ CH = "http://localhost:8123"
 USER, PWD, DB = "tracemap", "change-me-locally", "tracemap"
 
 
+# F49. Minutes of settling before a bucket is comparable. The reconciler's
+# rolling 5-minute lookback means the newest bucket is always partially written
+# on its side; 2 minutes clears it without discarding useful history.
+RECON_SETTLE_MIN = 2
+
 def q(sql: str) -> list[dict]:
     req = urllib.request.Request(
         f"{CH}/?database={DB}",
@@ -204,6 +209,24 @@ def main() -> int:
     # itself - so summing each over a wide window compares periods where only one
     # of them has rows and reports a divergence that is an artifact of the query.
     # An INNER join on the bucket is the apples-to-apples comparison.
+    # F49. The TRAILING bucket is excluded, and that is not a loosened
+    # tolerance -- it is declining to compare a number that is still being
+    # written.
+    #
+    # The reconciler works from `tracemap.spans` on a rolling 5-minute
+    # lookback, so the most recent minute is always partially populated on its
+    # side while the assembler has already finished with it. Measured, on a
+    # stack under steady load:
+    #
+    #   18:13  assembled 3366  reconciled 3366   0.00%
+    #   18:14  assembled 3414  reconciled 3414   0.00%
+    #   ...
+    #   18:19  assembled 3520  reconciled 2881  22.18%   <- still being written
+    #
+    # Seven settled buckets agreeing to within 0.85%, and one in-flight bucket
+    # 22% low, is not a 3.5% divergence in the pipeline. It is a comparison
+    # that included data that had not arrived. The same reasoning as the
+    # assembler's own LATE_SPAN_GRACE_S, applied to the thing that checks it.
     joined = q(f"""
         SELECT a.time_bucket AS tb, a.src AS src, a.dst AS dst,
                a.n AS assembled, r.n AS reconciled
@@ -212,6 +235,7 @@ def main() -> int:
                    source_service AS src, target_service AS dst, count() AS n
             FROM tracemap.trace_edges
             WHERE time_bucket >= now() - INTERVAL {args.window}
+              AND time_bucket <  now() - INTERVAL {RECON_SETTLE_MIN} MINUTE
             GROUP BY time_bucket, src, dst
         ) a
         INNER JOIN (
@@ -219,6 +243,7 @@ def main() -> int:
                    max(request_count) AS n
             FROM tracemap.service_edges_recon
             WHERE time_bucket >= now() - INTERVAL {args.window}
+              AND time_bucket <  now() - INTERVAL {RECON_SETTLE_MIN} MINUTE
             GROUP BY time_bucket, src, dst
         ) r USING (time_bucket, src, dst)
     """)

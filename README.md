@@ -42,14 +42,16 @@ by design.
 > windows reset before completing, 19 of them above 500 ms, the largest at
 > +2170 ms** (**F48**). A 2.17-second delta failing to confirm is not a threshold
 > set too high — it is a 2-vCPU runner too contended to hold a 3-of-5 window.
-> MTTD p95 clears its ceiling in every run.
+> Measured on a quiet host: the same edge, same code, same load, learns a noise
+> floor of **5.06 ms** here against **at least 58.5 ms** on the runner. MTTD p95
+> clears its ceiling in every run.
 > [`docs/EVAL.md §9`](docs/EVAL.md) has all five runs and what each one bought.
 >
 > The **live URL is not deployed**, and the **demo video is not recorded**
 > ([`docs/DEMO.md`](docs/DEMO.md) is the script it follows).
 >
-> Forty-eight defects are logged in
-> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), ten of them found in
+> Fifty defects are logged in
+> [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md), twelve of them found in
 > Phase 8 by running the system rather than reading it.
 
 ---

@@ -430,7 +430,7 @@ snapshot shows why: it budgets a 250 ms burn to overtake an edge recorded at
 
 But the remaining failures are not what four runs of threshold work assumed.
 
-### F48 — the confirmation window cannot complete on a contended runner
+### F48 — the confirmation window cannot complete on a contended runner (measured)
 
 The detector confirms a breach with **3 cycles out of the last 5**, one a minute.
 That assumes bucket-to-bucket critical p99 is stable enough for three of five
@@ -471,6 +471,56 @@ this entry is wrong and the detector owns it.
 This was predicted before the very first dispatch — *"it may also fail, and if it
 does, that is a genuine finding about where this suite can run, not a wasted
 afternoon."* Five runs later it is measured rather than predicted.
+
+**Measured, 12 Sep 2026.** F48 named its own test and the test has been run — not
+as a full control eval, but as a direct measurement of the quantity the claim is
+actually about. The substrate, not the scoreboard.
+
+Same stack, same commit, same 20 rps load profile, on a machine with 18 vCPU
+available to Docker instead of the runner's 2.
+
+| | this host (18 vCPU) | CI run 14 (2 vCPU) |
+|---|---|---|
+| `gateway-svc→order-svc` critical p99, mean | **176.4 ms** | 391.2 ms |
+| `order-svc→payment-svc` critical p99, mean | **148.3 ms** | 307.8 ms |
+| `gateway-svc→order-svc`, range over 38 one-minute buckets | **133.2 – 274.0 ms** | — |
+| largest excursion the detector logged | **+97.6 ms** | **+2170.4 ms** |
+
+And the detector's own learned dispersion, read straight out of Redis after
+warm-up on this host:
+
+```
+gateway-svc:order-svc:mad    5.06 ms     ->  bar = max(50, 20.2) = 50 ms  (the floor)
+order-svc:payment-svc:mad    0.18 ms     ->  bar = max(50,  0.7) = 50 ms  (the floor)
+```
+
+**On this host the F43 dispersion mechanism is completely inert.** Every edge
+sits on the brief's original 50 ms floor, so the detector here behaves exactly
+as the flat-threshold version did. That is the design working: dispersion only
+ever raises the bar, and there is no noise here to justify raising it.
+
+The CI figure can be bounded from the other direction. Run 14's null cases
+*passed*, so the 4 × MAD bar was high enough to suppress a measured +234 ms
+excursion on `gateway-svc→order-svc` — which requires **MAD > 58.5 ms** there.
+
+> **The same edge, the same code, the same load: a noise floor of 5.06 ms here
+> and at least 58.5 ms on the runner. A factor of eleven, minimum.**
+
+The whole observed range on this host — 141 ms wide — is narrower than a single
+CI excursion, and CI logged breach deltas up to twenty-two times the largest
+excursion seen here.
+
+**What this establishes, stated narrowly.** The measurement substrate differs by
+an order of magnitude between the two hosts, which is precisely what F48 claims
+and precisely what determines whether a 3-of-5 confirmation window can hold. It
+does **not** establish that a full twelve-case run would go green here — that run
+was not performed, and three attempts to run one in the background were killed by
+the environment before the first case started. The honest sentence is *"the
+substrate is eleven times quieter and the detector's own dispersion estimate says
+so"*, not *"the suite passes on a bigger box"*.
+
+**What would close it completely** is still one full-set run on a 4-vCPU runner,
+which `vars.EVAL_RUNNER` now exists to enable without a code change.
 
 ### What is not being done about it
 
