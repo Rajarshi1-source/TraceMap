@@ -514,10 +514,20 @@ excursion seen here.
 an order of magnitude between the two hosts, which is precisely what F48 claims
 and precisely what determines whether a 3-of-5 confirmation window can hold. It
 does **not** establish that a full twelve-case run would go green here — that run
-was not performed, and three attempts to run one in the background were killed by
-the environment before the first case started. The honest sentence is *"the
-substrate is eleven times quieter and the detector's own dispersion estimate says
-so"*, not *"the suite passes on a bigger box"*.
+was not performed. Two attempts were made and **the harness refused to score
+either one**: the analytics API became unreachable partway through, and the
+runner abandoned at 0/4 and 0/1 cases rather than charging every remaining case
+as a false negative. It declined to record the run at all -- *"eval_runs is a
+table of measurements, not of attempts"* -- and stamped the empty scoreboard
+*"diagnostic only. Do not quote them and do not record them as a baseline."*
+
+That is the harness working correctly, and it is worth more than the data would
+have been: the one thing a quality gate must never do is emit a plausible number
+from a broken measurement. It emitted zeros and said why.
+
+The honest sentence is therefore *"the substrate is eleven times quieter and the
+detector's own dispersion estimate says so"*, not *"the suite passes on a bigger
+box"*.
 
 **What would close it completely** is still one full-set run on a 4-vCPU runner,
 which `vars.EVAL_RUNNER` now exists to enable without a code change.
